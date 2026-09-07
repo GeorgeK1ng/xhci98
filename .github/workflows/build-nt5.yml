@@ -1,4 +1,4 @@
-name: Build NT 5.x targets
+name: Build Windows 2000 through Windows 7 targets
 
 on:
   push:
@@ -37,17 +37,67 @@ jobs:
 
       - name: Build Windows XP x86
         shell: cmd
+        continue-on-error: true
         run: scripts\build-wdk71-target.cmd x86 WXP windows-xp-x86
+
+      - name: Build Windows 2000 x86
+        shell: cmd
+        continue-on-error: true
+        run: scripts\build-wdk71-target.cmd x86 W2K windows-2000-x86
 
       - name: Build Server 2003 x86
         shell: cmd
+        continue-on-error: true
         run: scripts\build-wdk71-target.cmd x86 WNET server-2003-x86
 
       - name: Build Windows XP x64
         shell: cmd
+        continue-on-error: true
         run: scripts\build-wdk71-target.cmd x64 WNET windows-xp-x64
 
+      - name: Build Windows Vista and Server 2008 x86
+        shell: cmd
+        continue-on-error: true
+        run: scripts\build-wdk71-target.cmd x86 WLH vista-server-2008-x86
+
+      - name: Build Windows Vista and Server 2008 x64
+        shell: cmd
+        continue-on-error: true
+        run: scripts\build-wdk71-target.cmd x64 WLH vista-server-2008-x64
+
+      - name: Build Windows 7 x86
+        shell: cmd
+        continue-on-error: true
+        run: scripts\build-wdk71-target.cmd x86 WIN7 windows-7-x86
+
+      - name: Build Windows 7 x64
+        shell: cmd
+        continue-on-error: true
+        run: scripts\build-wdk71-target.cmd x64 WIN7 windows-7-x64
+
+      - name: Verify all target artifacts
+        if: always()
+        shell: pwsh
+        run: |
+          $targets = @(
+            'windows-2000-x86',
+            'windows-xp-x86',
+            'server-2003-x86',
+            'windows-xp-x64',
+            'vista-server-2008-x86',
+            'vista-server-2008-x64',
+            'windows-7-x86',
+            'windows-7-x64'
+          )
+          $missing = @($targets | Where-Object {
+            -not (Test-Path (Join-Path 'artifact' "$_\xhci98.sys"))
+          })
+          if ($missing.Count -ne 0) {
+            throw "Builds missing xhci98.sys: $($missing -join ', ')"
+          }
+
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: xhci98-nt5
+          name: xhci98-windows-2000-through-7
           path: artifact

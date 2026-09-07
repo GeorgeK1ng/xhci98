@@ -12,6 +12,8 @@ if "%CPU%"=="x64" set "OUTARCH=amd64"
 if "%OUTARCH%"=="" goto usage
 if "%TARGET%"=="" goto usage
 if "%ARTIFACT%"=="" goto usage
+if not exist "%ROOT%\artifact" mkdir "%ROOT%\artifact"
+if errorlevel 1 goto fail
 
 call "%DDKROOT%\bin\setenv.bat" %DDKROOT% fre %CPU% %TARGET% no_oacr
 if errorlevel 1 goto fail
@@ -23,7 +25,10 @@ call scripts\make-usbport-lib-wdk.cmd %CPU%
 if errorlevel 1 goto fail
 cd /d "%ROOT%\src"
 build -ceZ
-if errorlevel 1 goto fail
+set "BUILD_RC=%ERRORLEVEL%"
+if exist "buildfre.log" copy /y "buildfre.log" "%ROOT%\artifact\%ARTIFACT%-build.log" >nul
+if exist "buildfre.err" copy /y "buildfre.err" "%ROOT%\artifact\%ARTIFACT%-build.err" >nul
+if not "%BUILD_RC%"=="0" goto builderror
 if not exist "objfre\%OUTARCH%\xhci98.sys" goto nooutput
 
 if exist "%ROOT%\artifact\%ARTIFACT%" rmdir /s /q "%ROOT%\artifact\%ARTIFACT%"
@@ -33,11 +38,13 @@ copy /y "objfre\%OUTARCH%\xhci98.sys" "%ROOT%\artifact\%ARTIFACT%\xhci98.sys" >n
 if errorlevel 1 goto fail
 copy /y "%ROOT%\src\xhci98.inf" "%ROOT%\artifact\%ARTIFACT%\xhci98.inf" >nul
 if errorlevel 1 goto fail
+if exist "buildfre.log" copy /y "buildfre.log" "%ROOT%\artifact\%ARTIFACT%\build.log" >nul
+if exist "buildfre.err" copy /y "buildfre.err" "%ROOT%\artifact\%ARTIFACT%\build.err" >nul
 endlocal
 exit /b 0
 
 :usage
-echo ERROR: usage: build-wdk71-target.cmd ^<x86^|x64^> ^<WXP^|WNET^> ^<artifact-name^>
+echo ERROR: usage: build-wdk71-target.cmd ^<x86^|x64^> ^<W2K^|WXP^|WNET^|WLH^|WIN7^> ^<artifact-name^>
 endlocal
 exit /b 2
 :noddk
@@ -49,3 +56,12 @@ echo ERROR: expected objfre\%OUTARCH%\xhci98.sys was not built.
 :fail
 endlocal
 exit /b 1
+:builderror
+echo.
+echo ===== buildfre.err =====
+if exist "buildfre.err" type "buildfre.err"
+echo.
+echo ===== buildfre.log =====
+if exist "buildfre.log" type "buildfre.log"
+endlocal
+exit /b %BUILD_RC%
