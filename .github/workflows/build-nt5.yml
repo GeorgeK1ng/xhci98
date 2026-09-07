@@ -56,6 +56,8 @@ jobs:
         run: |
           call "%DDKROOT%\bin\setenv.bat" %DDKROOT% fre ${{ matrix.cpu }} ${{ matrix.target }} no_oacr
           if errorlevel 1 exit /b 1
+          cd /d "%GITHUB_WORKSPACE%"
+          if errorlevel 1 exit /b 1
           call scripts\make-usbport-lib-wdk.cmd ${{ matrix.cpu }}
           if errorlevel 1 exit /b 1
           cd /d src
