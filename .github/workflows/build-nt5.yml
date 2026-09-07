@@ -1,4 +1,4 @@
-name: Build Windows 2000 through Windows 7 targets
+name: Build Windows XP through Windows 7 targets
 
 on:
   push:
@@ -40,11 +40,6 @@ jobs:
         continue-on-error: true
         run: scripts\build-wdk71-target.cmd x86 WXP windows-xp-x86
 
-      - name: Build Windows 2000 x86
-        shell: cmd
-        continue-on-error: true
-        run: scripts\build-wdk71-target.cmd x86 W2K windows-2000-x86
-
       - name: Build Server 2003 x86
         shell: cmd
         continue-on-error: true
@@ -80,7 +75,6 @@ jobs:
         shell: pwsh
         run: |
           $targets = @(
-            'windows-2000-x86',
             'windows-xp-x86',
             'server-2003-x86',
             'windows-xp-x64',
@@ -99,5 +93,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xhci98-windows-2000-through-7
+          name: xhci98-windows-xp-through-7
           path: artifact

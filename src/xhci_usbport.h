@@ -159,7 +159,7 @@ typedef struct _USBPORT_RESOURCES {
     ULONG InterruptVector;      /* 0x08                                     */
     UCHAR InterruptLevel;       /* 0x0C KIRQL                               */
     UCHAR Padded1[3];
-    ULONG InterruptAffinity;    /* 0x10 KAFFINITY                           */
+    ULONG_PTR InterruptAffinity;/* 0x10 KAFFINITY                           */
     UCHAR ShareVector;          /* 0x14 BOOLEAN                             */
     UCHAR Padded2[3];
     ULONG InterruptMode;        /* 0x18 KINTERRUPT_MODE enum                */
@@ -610,7 +610,11 @@ typedef struct _USBPORT_REGISTRATION_PACKET {
  * binary-confirmed x86 layout: they are a compile-time guard for the amd64
  * build and must not be cited as evidence for the x86 contract below.
  */
-XHCI_C_ASSERT(resources_size, sizeof(USBPORT_RESOURCES) == 0x40);
+XHCI_C_ASSERT(resources_size, sizeof(USBPORT_RESOURCES) == 0x48);
+XHCI_C_ASSERT(resources_base_offset,
+              XHCI_OFFSET_OF(USBPORT_RESOURCES, ResourceBase) == 0x28);
+XHCI_C_ASSERT(resources_start_va_offset,
+              XHCI_OFFSET_OF(USBPORT_RESOURCES, StartVA) == 0x38);
 XHCI_C_ASSERT(endpoint_properties_size,
               sizeof(USBPORT_ENDPOINT_PROPERTIES) == 0x48);
 XHCI_C_ASSERT(endpoint_requirements_size,
