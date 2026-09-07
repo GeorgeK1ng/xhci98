@@ -998,7 +998,7 @@ static MPSTATUS NTAPI xhciStartController(PVOID miniPortExtension,
 
     (VOID)XhciControllerUpdateFlags(ext, 0, XHCI_EXT_FLAG_STARTED);
     /* The mapped register base - an address, for the reason above. */
-    XhciLogNoteAddress(ext, "start.ok", ext->ResourceBase);
+    XhciLogNoteAddress(ext, "start.ok", (ULONG)(ULONG_PTR)ext->ResourceBase);
     return MP_STATUS_SUCCESS;
 }
 
