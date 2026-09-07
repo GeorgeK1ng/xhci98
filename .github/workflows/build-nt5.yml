@@ -8,19 +8,6 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: windows-xp-x86
-            cpu: x86
-            target: WXP
-          - name: server-2003-x86
-            cpu: x86
-            target: WNET
-          - name: windows-xp-x64
-            cpu: x64
-            target: WNET
     env:
       WDK71_ISO_URL: https://github.com/KunYi/WDK_DDKArchive/releases/download/WDK_v7.1.0/GRMWDK_EN_7600_1.ISO
       WDK_INSTALL_DIR: C:\WinDDK
@@ -48,33 +35,19 @@ jobs:
           if (-not $setenv) { throw 'setenv.bat was not installed.' }
           "DDKROOT=$($setenv.Directory.Parent.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding ascii
 
-      - name: Build ${{ matrix.name }}
+      - name: Build Windows XP x86
         shell: cmd
-        run: |
-          call "%DDKROOT%\bin\setenv.bat" %DDKROOT% fre ${{ matrix.cpu }} ${{ matrix.target }} no_oacr
-          if errorlevel 1 exit /b 1
-          set "BUILD_ALT_DIR=fre"
-          cd /d "%GITHUB_WORKSPACE%"
-          if errorlevel 1 exit /b 1
-          call scripts\make-usbport-lib-wdk.cmd ${{ matrix.cpu }}
-          if errorlevel 1 exit /b 1
-          cd /d src
-          build -ceZ
-          if errorlevel 1 exit /b 1
+        run: scripts\build-wdk71-target.cmd x86 WXP windows-xp-x86
 
-      - name: Collect driver
-        shell: pwsh
-        run: |
-          $drivers = @(Get-ChildItem src -Recurse -Filter xhci98.sys)
-          if ($drivers.Count -ne 1) {
-            throw "Expected exactly one xhci98.sys output, found $($drivers.Count)."
-          }
-          $driver = $drivers[0]
-          New-Item artifact -ItemType Directory -Force | Out-Null
-          Copy-Item $driver.FullName artifact\xhci98.sys
-          Copy-Item src\xhci98.inf artifact\xhci98.inf
+      - name: Build Server 2003 x86
+        shell: cmd
+        run: scripts\build-wdk71-target.cmd x86 WNET server-2003-x86
+
+      - name: Build Windows XP x64
+        shell: cmd
+        run: scripts\build-wdk71-target.cmd x64 WNET windows-xp-x64
 
       - uses: actions/upload-artifact@v4
         with:
-          name: xhci98-${{ matrix.name }}
+          name: xhci98-nt5
           path: artifact
