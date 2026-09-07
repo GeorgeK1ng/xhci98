@@ -86,7 +86,7 @@ DriverVer=09/04/2026,1.0.1.0
 ; project: this driver binds by class code, so the silicon is Intel's or AMD's
 ; or Renesas's and naming anyone here as its maker would be false.
 [Manufacturer]
-%Mfg%=XhciModels
+%Mfg%=XhciModels,NTx86,NTamd64
 
 ; PCI\CC_0C0330 is the xHCI class-code compatible ID, the exact analog of the
 ; PCI\CC_0C0320 catch-all both reference INFs use for EHCI. Nothing else on
@@ -94,6 +94,12 @@ DriverVer=09/04/2026,1.0.1.0
 ; and Code 1 on Windows 2000), so a compatible-ID match needs no
 ; vendor-specific entry to outrank.
 [XhciModels]
+%XhciDesc%=Xhci.Dev,PCI\CC_0C0330
+
+[XhciModels.NTx86]
+%XhciDesc%=Xhci.Dev,PCI\CC_0C0330
+
+[XhciModels.NTamd64]
 %XhciDesc%=Xhci.Dev,PCI\CC_0C0330
 
 [SourceDisksNames]
@@ -277,6 +283,14 @@ CopyFiles=Xhci.CopyFiles,Xhci.CopyNT
 [Xhci.Dev.NTx86.Services]
 AddService=xhci98,0x00000002,Xhci.AddService
 
+; Windows XP Professional x64 uses the NT 5.2 amd64 build.
+[Xhci.Dev.NTamd64]
+AddReg=Xhci.AddReg.NT,Xhci.AddReg.Global
+CopyFiles=Xhci.CopyFiles,Xhci.CopyNT
+
+[Xhci.Dev.NTamd64.Services]
+AddService=xhci98,0x00000002,Xhci.AddService
+
 [Xhci.AddService]
 DisplayName=%XhciSvcDesc%
 ServiceType=1                       ; SERVICE_KERNEL_DRIVER
@@ -388,6 +402,10 @@ AddReg=Xhci.AddReg.Global
 ; Win2000's setup engine keeps its own copy of an OEM INF as oemN.inf; copying
 ; this one into %17% as well would leave two INFs claiming PCI\CC_0C0330.
 [DefaultInstall.NTx86]
+CopyFiles=Xhci.CopyFiles,Xhci.CopyNT
+AddReg=Xhci.AddReg.Global
+
+[DefaultInstall.NTamd64]
 CopyFiles=Xhci.CopyFiles,Xhci.CopyNT
 AddReg=Xhci.AddReg.Global
 

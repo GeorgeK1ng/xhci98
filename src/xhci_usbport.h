@@ -601,8 +601,38 @@ typedef struct _USBPORT_REGISTRATION_PACKET {
  * every structure" - the ordinary support structures are pinned by size and by
  * group boundary - so it is written as what it is.)*
  */
-#define XHCI_OFFSET_OF(type, field) ((ULONG)&(((type *)0)->field))
+#define XHCI_OFFSET_OF(type, field) ((ULONG_PTR)&(((type *)0)->field))
 
+#ifdef _WIN64
+/*
+ * The NT 5.2 amd64 port uses the same field order with native-width virtual
+ * addresses and callback pointers.  Keep these assertions separate from the
+ * binary-confirmed x86 layout: they are a compile-time guard for the amd64
+ * build and must not be cited as evidence for the x86 contract below.
+ */
+XHCI_C_ASSERT(resources_size, sizeof(USBPORT_RESOURCES) == 0x40);
+XHCI_C_ASSERT(endpoint_properties_size,
+              sizeof(USBPORT_ENDPOINT_PROPERTIES) == 0x48);
+XHCI_C_ASSERT(endpoint_requirements_size,
+              sizeof(USBPORT_ENDPOINT_REQUIREMENTS) == 8);
+XHCI_C_ASSERT(setup_packet_size, sizeof(XHCI_SETUP_PACKET) == 8);
+XHCI_C_ASSERT(transfer_parameters_size,
+              sizeof(USBPORT_TRANSFER_PARAMETERS) == 28);
+XHCI_C_ASSERT(sg_element_size,
+              sizeof(USBPORT_SCATTER_GATHER_ELEMENT) == 24);
+XHCI_C_ASSERT(sg_list_size, sizeof(USBPORT_SCATTER_GATHER_LIST) == 0x50);
+XHCI_C_ASSERT(packet_size, sizeof(USBPORT_REGISTRATION_PACKET) == 0x248);
+XHCI_C_ASSERT(packet_first_callback_offset,
+              XHCI_OFFSET_OF(USBPORT_REGISTRATION_PACKET, OpenEndpoint) == 0x28);
+XHCI_C_ASSERT(packet_start_controller_offset,
+              XHCI_OFFSET_OF(USBPORT_REGISTRATION_PACKET, StartController) == 0x48);
+XHCI_C_ASSERT(packet_first_roothub_offset,
+              XHCI_OFFSET_OF(USBPORT_REGISTRATION_PACKET, RH_GetRootHubData) == 0xF8);
+XHCI_C_ASSERT(packet_service_block_start,
+              XHCI_OFFSET_OF(USBPORT_REGISTRATION_PACKET, UsbPortDbgPrint) == 0x1A0);
+XHCI_C_ASSERT(packet_tail_group_start,
+              XHCI_OFFSET_OF(USBPORT_REGISTRATION_PACKET, RebalanceEndpoint) == 0x220);
+#else
 XHCI_C_ASSERT(resources_size, sizeof(USBPORT_RESOURCES) == 52);
 XHCI_C_ASSERT(endpoint_properties_size,
               sizeof(USBPORT_ENDPOINT_PROPERTIES) == 64);
@@ -664,6 +694,7 @@ XHCI_C_ASSERT(packet_tail_group_start,
               XHCI_OFFSET_OF(USBPORT_REGISTRATION_PACKET, RebalanceEndpoint) == 0x124);
 XHCI_C_ASSERT(packet_last_reserved,
               XHCI_OFFSET_OF(USBPORT_REGISTRATION_PACKET, Reserved5) == 0x138);
+#endif
 
 /* ------------------------------------------------------------------ */
 /* The two usbport.sys exports (linked through src/usbport.lib)        */
