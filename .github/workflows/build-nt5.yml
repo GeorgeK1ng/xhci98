@@ -15,15 +15,12 @@ jobs:
           - name: windows-xp-x86
             cpu: x86
             target: WXP
-            object: objfre_WXP_x86
           - name: server-2003-x86
             cpu: x86
             target: WNET
-            object: objfre_WNET_x86
           - name: windows-xp-x64
             cpu: x64
             target: WNET
-            object: objfre_WNET_amd64
     env:
       WDK71_ISO_URL: https://github.com/KunYi/WDK_DDKArchive/releases/download/WDK_v7.1.0/GRMWDK_EN_7600_1.ISO
       WDK_INSTALL_DIR: C:\WinDDK
@@ -56,6 +53,7 @@ jobs:
         run: |
           call "%DDKROOT%\bin\setenv.bat" %DDKROOT% fre ${{ matrix.cpu }} ${{ matrix.target }} no_oacr
           if errorlevel 1 exit /b 1
+          set "BUILD_ALT_DIR=fre"
           cd /d "%GITHUB_WORKSPACE%"
           if errorlevel 1 exit /b 1
           call scripts\make-usbport-lib-wdk.cmd ${{ matrix.cpu }}
@@ -67,10 +65,11 @@ jobs:
       - name: Collect driver
         shell: pwsh
         run: |
-          $driver = Get-ChildItem src -Recurse -Filter xhci98.sys |
-            Where-Object FullName -Like '*\${{ matrix.object }}\*' |
-            Select-Object -First 1
-          if (-not $driver) { throw 'The expected xhci98.sys output was not found.' }
+          $drivers = @(Get-ChildItem src -Recurse -Filter xhci98.sys)
+          if ($drivers.Count -ne 1) {
+            throw "Expected exactly one xhci98.sys output, found $($drivers.Count)."
+          }
+          $driver = $drivers[0]
           New-Item artifact -ItemType Directory -Force | Out-Null
           Copy-Item $driver.FullName artifact\xhci98.sys
           Copy-Item src\xhci98.inf artifact\xhci98.inf
