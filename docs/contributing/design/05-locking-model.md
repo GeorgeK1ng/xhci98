@@ -91,15 +91,35 @@ poll; and every `Flags` transition listed above.
 ### What is outside it
 
 The init and reinit sequence (`XhciInitController` and everything it calls)
-runs at PASSIVE_LEVEL holding nothing, and touches the extension freely. That
-is safe on a stated precondition rather than by omission: the function clears
-`XHCI_EXT_FLAG_INITIALIZED` under the lock as its first act, and every
-DISPATCH-level path that could touch controller state (DPC, health poll,
-command submit, interrupt enable) tests that flag under the lock before doing
-anything. So the sequence runs with every other context already refusing. The
-ISR's separate `HcInfoStatus` gate covers the same window for the one context
-that has no admission flag; `XhciInitController` sets `HcInfoStatus` bad on
-entry for that reason.
+runs holding nothing (at PASSIVE_LEVEL on a start, at DISPATCH_LEVEL from the
+in-place recovery's DPC), and touches the controller registers and the
+controller-side state freely. That is safe on a stated precondition rather
+than by omission: the function clears `XHCI_EXT_FLAG_INITIALIZED` under the
+lock as its first act, and every DISPATCH-level path that touches controller
+state (DPC, health poll, command submit, interrupt enable) tests that flag
+under the lock before doing anything. So the sequence runs with those
+contexts already refusing. The ISR's separate `HcInfoStatus` gate covers the
+same window for the one context that has no admission flag;
+`XhciInitController` sets `HcInfoStatus` bad on entry for that reason.
+
+The precondition does not extend to the device table, and the 2026-09-05
+audit (roadmap Phase 20, F8) is why that has to be said. The slot callbacks
+(`SubmitTransfer`, `SetEndpointState`, `AbortTransfer`, `XhciSlotDeferredWork`)
+read and write `Devices[]` under the controller lock with no admission gate:
+`xhciDevAdmitted` is consulted only after the record has been read, and
+recovery itself calls the deferred drain to deliver owed completions while
+`INITIALIZED` is clear. The in-place recovery runs `XhciSlotInit` from a DPC
+with the controller still live from usbport's point of view, so on SMP a
+callback on another CPU is not refusing while the table is reset. That reset
+is therefore not part of the lockless sequence: `XhciSlotInit` cancels the
+queued work, zeroes the table and resets the owner and cursor fields inside
+one hold of the controller lock, so a callback sees the old table or the new
+one and never a half-zeroed record. The single-drainer guard `DeferredBusy`
+is not written there at all. Its owner is the `XhciSlotDeferredWork` call
+that set it, which drops the lock around every usbport service and re-takes
+it afterwards; clearing the flag under it would admit a second drainer, and a
+set flag at reinitialisation names a drainer that is still running and will
+clear it itself.
 
 The diagnostic counters, per the note in `XHCI_EXTENSION`: nothing branches
 on them and a torn count costs nothing.
@@ -241,13 +261,16 @@ that was not serialized against the drain could publish a pointer the DPC has
 already moved past, and could clear `EHB` mid-pass.
 
 The rule: any `ERDP` writer holds the controller lock, or holds the section 2
-precondition instead. There are three:
+precondition instead. There are three in every shipping build, and a fourth
+behind `XHCI_FIX_EVT_REARM` (`src/xhci_cmd.c`), a bench candidate no flavour
+defines, which takes the controller lock like the first two:
 
 | Writer | What serializes it |
 |---|---|
 | `XhciEventDpc` | the controller lock, for the whole drain |
 | `XhciEnableInterrupts` | the controller lock, with both enables still clear |
 | `XhciEventDiscardStale` | no lock; the section 2 precondition, below |
+| the `XHCI_FIX_EVT_REARM` re-arm (compiled out) | the controller lock |
 
 (The init sequence programs `ERDP` too, under the same precondition.)
 
@@ -323,7 +346,11 @@ plus the three non-callback entry points, not from recall.
 | `xhciRhPortTimeout` (async) | DISPATCH, no usbport lock | port shadow, `PORTSC` | two pointer checks before the lock; epoch, hub port and generation all validated under it, and the generation is claimed before any register is read |
 | `RH_DisableIrq` / `RH_EnableIrq` | DISPATCH | `Flags` | one `XhciControllerUpdateFlags` transition; touches no register |
 | `RH_ChirpRootPort` | DISPATCH | a counter | no register, no lock |
-| `OpenEndpoint` / `ReopenPipe` / `SetEndpointState` / `PollEndpoint` | DISPATCH, `MiniportSpinLock` | endpoint record, its ring and queue, the quiesce state | the controller lock; the Configure/Stop/Set TR Dequeue commands are issued under it and nothing waits |
+| `OpenEndpoint` / `ReopenEndpoint` / `SetEndpointState` / `PollEndpoint` | DISPATCH, `MiniportSpinLock` | endpoint record, its ring and queue, the quiesce state | the controller lock; the Configure/Stop/Set TR Dequeue commands are issued under it and nothing waits. A handle the record is bound to a different extension than is declined under the same lock (`xhciEpHandleSuperseded`, roadmap Phase 20, F1), except a `PAUSED` from a handle that still owns queued work (`xhciEpHandleOwnsWork`), which starts the stop that handle's abort needs |
+| `CloseEndpoint` / `GetEndpointState` / `QueryEndpointRequirements` | DISPATCH, `MiniportSpinLock` | the probe's counters only | the controller lock, taken inside `XhciProbeEndpoint` (`src/xhci_probe.c`); no record is read or written, and neither shipping build calls the first two |
+| `GetEndpointStatus` / `SetEndpointStatus` / `SetEndpointDataToggle` | DISPATCH, `MiniportSpinLock` | the record's quiesce state (the status pair); a counter (the toggle) | the controller lock; the reset-pipe chain is armed under it and driven by the deferred pass, and a superseded handle is declined |
+| `RebalanceEndpoint` / `StartSendOnePacket` / `EndSendOnePacket` | DISPATCH, `MiniportSpinLock` | a counter and a trace line | no register, no record, no lock needed |
+| `PassThru` | <= DISPATCH, the caller's context | the whole extension and the PORTSC array, read only | the controller lock across the whole snapshot (design record 08 section 13); acknowledges nothing |
 | `SubmitTransfer` | DISPATCH, `MiniportSpinLock` | transfer queue, ring, `SubmitEpoch` | the controller lock; the completion is deferred out of the submit bracket (section 7) rather than made inside it |
 | `SubmitIsoTransfer` | DISPATCH, `MiniportSpinLock` | as `SubmitTransfer` | reached through the same routine as `SubmitTransfer`, under the same lock at the same IRQL, so it follows that row's rules rather than needing its own (task 9-A.1). Listed separately so its absence from the rules is not read as an omission |
 | `AbortTransfer` | DISPATCH, `MiniportSpinLock` | transfer queue, completion list, quiesce state | the controller lock; searches the completion list as well as the queue (batch 7a-B) |
@@ -647,13 +674,22 @@ Driver Verifier enabled, is what tests the design rather than its shape.
 ## 10. Open against the SMP checkpoint
 
 - The ISR/mask interleaving is closed by argument and by the direction of a
-  single bit. Confirm on the SMP VM that no interrupt storm and no lost
-  interrupt follows a `DisableInterrupts` under load.
+  single bit, and answered on the SMP VM: batch 7a-V's guest 2d reading below,
+  and Phase 11's stress runs on the same guest, show neither an interrupt
+  storm nor a lost interrupt following a `DisableInterrupts` under load.
 - The drain's hold time is unmeasured. Phase 6 adds work inside it; section 8
   is the trigger.
-- `FlushInterrupts` is counted, never acted on. If `InterruptFlushes` is still
-  zero after a D0 transition on either target, the call site was read wrong and
-  section 5 needs revisiting.
+- `FlushInterrupts` is counted, never acted on, and the check written here
+  cannot be run: it wants a D0 transition, and neither target can produce one.
+  `ResumeController` has never run on Windows 2000 - no QEMU configuration
+  delivers a sleep state, and that is a published limitation - while Windows
+  98's idle "suspend" of this controller is a software halt with the device
+  left in D0, so nothing writes a power register at suspend time
+  (`lessons.md`). A zero `InterruptFlushes` on either target is therefore the
+  expected reading and says nothing about whether the call site was read
+  right; `usbport-miniport-abi.md`, "`FlushInterrupts`: the call site the
+  mirror does not have", is where that question is actually settled, out of
+  all three shipping binaries.
 - The SMP reading that exists (batch 7a-V, guest 2d: WHPX, two vCPUs on
   distinct host threads, `info cpus` checked before and after):
   `AbortsDuringCompletion` stayed 0 across 14 aborts driven against live

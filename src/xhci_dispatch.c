@@ -1110,7 +1110,13 @@ static VOID NTAPI xhciStopController(PVOID miniPortExtension,
  * than what is here - lives with them.
  *
  * IRQL: PASSIVE_LEVEL. Win98's NUSB usbport issues these pairs repeatedly at
- * idle; native Win2000 usbport never idle-suspended the controller at all.
+ * idle, and XP's after about thirty seconds with nothing attached; native
+ * Win2000 SP4 usbport was not seen idling this controller in the VM - 0 in
+ * thirteen minutes on the Standard PC guest with DisableSelectiveSuspend
+ * deleted, nothing attached and then a mouse, and 0 in fifty minutes on the
+ * ACPI SMP guest with no value and a mouse attached (2026-09-06,
+ * roadmap Phase 20, F18; build-and-test.md has the conditions and an
+ * unconfirmed hub-driver inference). The pair is target-agnostic either way.
  */
 static VOID NTAPI xhciSuspendController(PVOID miniPortExtension)
 {
@@ -1437,6 +1443,13 @@ static VOID NTAPI xhciCheckController(PVOID miniPortExtension)
      * consecutive, and only the second decides whether another is armed. */
     XHCI_DBG_VALUE_CHANGED("in-place recovery consecutive refusals",
                            ext->RecoveryFailuresConsecutive);
+    /* F2: an arming whose callback never came, aged out by the health poll and
+     * charged to the consecutive count; and a callback that arrived after its
+     * arming had been aged out, declined by generation. */
+    XHCI_DBG_VALUE_CHANGED("in-place recovery deliveries lost",
+                           ext->RecoveryDeliveriesLost);
+    XHCI_DBG_VALUE_CHANGED("in-place recovery callbacks late",
+                           ext->RecoveryCallbacksLate);
     XHCI_DBG_VALUE_CHANGED("in-place recovery callbacks with nothing to do",
                            ext->RecoveryStaleCallbacks);
     XHCI_DBG_VALUE_CHANGED("in-place recovery, refusing init step",
@@ -1772,6 +1785,8 @@ static VOID NTAPI xhciCheckController(PVOID miniPortExtension)
      * added for. */
     XHCI_DBG_VALUE_CHANGED("transfers failed - endpoint gone",
                            ext->TransfersFailedGone);
+    XHCI_DBG_VALUE_CHANGED("transfers failed - stale endpoint handle",
+                           ext->TransfersFailedStale);
     /* And the net under both of them (task 7b-A.0): records the health poll gave
      * up on because they refused, placed nothing and had no command in flight.
      * Nonzero is this bound working - a device that would otherwise have been
@@ -1790,6 +1805,8 @@ static VOID NTAPI xhciCheckController(PVOID miniPortExtension)
                            ext->DevicesDisabledOut);
     XHCI_DBG_VALUE_CHANGED("transfer events for no open endpoint",
                            ext->TransferEventsForeign);
+    XHCI_DBG_VALUE_CHANGED("transfer events with RsvdZ pointer bits set",
+                           ext->TransferEventsReservedBitsSet);
     XHCI_DBG_VALUE_CHANGED("short packets", ext->ShortPacketsTotal);
     XHCI_DBG_VALUE_CHANGED("short transfers reported as Success",
                            ext->ShortSuccessesTotal);
@@ -1990,6 +2007,10 @@ static VOID NTAPI xhciCheckController(PVOID miniPortExtension)
     XHCI_DBG_VALUE_CHANGED("endpoint removes held", ext->EndpointRemovesHeld);
     XHCI_DBG_VALUE_CHANGED("EP0 removes on a superseded handle",
                            ext->Ep0RemovesSuperseded);
+    XHCI_DBG_VALUE_CHANGED("endpoint removes on a superseded handle",
+                           ext->EndpointRemovesSuperseded);
+    XHCI_DBG_VALUE_CHANGED("endpoint calls on a stale handle",
+                           ext->EndpointCallsStale);
     XHCI_DBG_VALUE_CHANGED("endpoint removes with work queued",
                            ext->RemovesWithWork);
     XHCI_DBG_VALUE_CHANGED("endpoint stops", ext->EndpointStops);
@@ -2393,6 +2414,8 @@ static VOID NTAPI xhciCheckController(PVOID miniPortExtension)
                            ext->CommandAbortsNotWritten);
     XHCI_DBG_VALUE_CHANGED("command abort waits", ext->CommandAbortWaits);
     XHCI_DBG_VALUE_CHANGED("command ring stops", ext->CommandRingStops);
+    XHCI_DBG_VALUE_CHANGED("command ring stops on the abandoned command",
+                           ext->CommandRingStoppedOnAbandoned);
     XHCI_DBG_VALUE_CHANGED("command ring diverged", ext->CommandRingDiverged);
     XHCI_DBG_VALUE_CHANGED("commands abandoned", ext->CommandsAbandoned);
     XHCI_DBG_VALUE_CHANGED("command stale callbacks",
@@ -2744,14 +2767,19 @@ static VOID NTAPI xhciCheckController(PVOID miniPortExtension)
  * So the body is what is safe here and nothing else: mask the interrupt enables
  * (two register writes, no wait) so a wedged controller cannot storm the shared
  * line, mark the controller failed so every later callback refuses rather than
- * touching hardware in an unknown state, and record the call. Recovery is a
- * stop/start - `XhciCommandInit` and `XhciInitController` both run at
- * PASSIVE_LEVEL from `StartController` - and there is no service a miniport can
- * call to request one.
+ * touching hardware in an unknown state, record the call, and **raise the
+ * recovery request**. The recovery itself is task 13-R.1's in-place one
+ * (design record 07): this callback requests it, the health poll arms one
+ * `UsbPortRequestAsyncCallback` for it (`xhciArmRecovery`), and that callback
+ * performs it (`xhciRecoveryCallback` -> `XhciRecoverController`) from the one
+ * context it is legal in - a DPC holding no usbport lock. The arming cannot
+ * happen here because the timer service takes a second usbport lock with no
+ * stated order against the reset-DPC lock this runs under.
  *
- * The engine that escalates here therefore does **not** wait to be rescued: it
- * stays out of service permanently, which is the honest terminal state for a
- * command ring that will not stop. See `XhciCommandEvent`'s divergence path.
+ * What stays terminal is a controller that will not come back: after
+ * XHCI_RECOVERY_MAX_ATTEMPTS consecutive refusals or lost deliveries the
+ * latch is left standing, measured rather than silent. See
+ * `XhciCommandEvent`'s divergence path for how the engine reaches here.
  */
 static VOID NTAPI xhciResetController(PVOID miniPortExtension)
 {
@@ -2863,6 +2891,20 @@ static VOID NTAPI xhciRecoveryCallback(PVOID miniPortExtension, PVOID context)
         return;
     }
 
+    if (armed->Generation != ext->RecoveryGeneration) {
+        /*
+         * **A callback from an arming the health poll has already aged out**
+         * (F2). Its arming was released and re-requested when it went
+         * undelivered for XHCI_RECOVERY_DELIVERY_POLLS, and a newer arming may
+         * own `RecoveryArmed` now - so this one may neither clear the latch
+         * nor run a recovery beside the newer one's. Counted and declined; the
+         * generation is what makes "late" a fact rather than a guess.
+         */
+        ext->RecoveryCallbacksLate++;
+        XhciControllerLockRelease(oldIrql);
+        return;
+    }
+
     ext->RecoveryArmed = 0;
     if ((ext->Flags & XHCI_EXT_FLAG_SUSPENDED) != 0) {
         /*
@@ -2956,6 +2998,57 @@ static VOID xhciArmRecovery(PXHCI_EXTENSION ext)
     armed.Attempt = 0;
 
     XhciControllerLockAcquire(&oldIrql);
+    /*
+     * **Age the arming that is already out** (the 2026-09-05 audit's F2).
+     * `UsbPortRequestAsyncCallback` answers 0 whether it queued the callback
+     * or failed its own pool allocation, so an arming that produced nothing is
+     * indistinguishable at the call - and until this block nothing ever
+     * released `RecoveryArmed` in that case: the attempts are counted only
+     * when a recovery runs, so the loss cost no attempt, the cap never bounded
+     * it, and the controller stayed latched with a recovery owed for ever.
+     *
+     * The clock is this poll, because it is the one periodic context that
+     * survives the latch (`PollClockMs` stops advancing on a failed
+     * controller). XHCI_RECOVERY_DELIVERY_POLLS of them with no callback is
+     * two orders of magnitude past the XHCI_RECOVERY_DELAY_MS the arming asked
+     * for, at the nominal 500 ms period, so a delivery that is merely slow is
+     * not mistaken for one that is lost. The generation advances here as well
+     * as at the arming, so the lost callback, should it arrive after all, is
+     * declined as late rather than running beside the recovery the re-arming
+     * below starts. The loss is charged to the consecutive count: repeated
+     * loss reaches the same bounded terminal state a refusing controller does,
+     * which is what "bounded by the cap" has to mean to be true. Polls while
+     * SUSPENDED do not age it, for the reason the predicate below declines
+     * then.
+     *
+     * The charge is made only while the latch still stands. An arming can also
+     * outlive its purpose: another path (a reinitialising resume, an earlier
+     * recovery) clears `ControllerFailed` while it is out. Ordinarily its
+     * callback then arrives, finds the latch clear, counts itself stale and
+     * releases the arming itself - the resume does not move the start epoch,
+     * so it still matches. This branch is for that arming when its delivery
+     * was lost as well: retired with nothing owed and nothing charged, counted
+     * with the callbacks that had nothing to do, because charging a healthy
+     * controller's budget for a recovery it no longer needed would spend the
+     * next incident's attempts on this one.
+     */
+    if (ext->RecoveryArmed && (ext->Flags & XHCI_EXT_FLAG_SUSPENDED) == 0) {
+        ext->RecoveryArmedPolls++;
+        if (ext->RecoveryArmedPolls >= XHCI_RECOVERY_DELIVERY_POLLS) {
+            ext->RecoveryArmed = 0;
+            ext->RecoveryArmedPolls = 0;
+            ext->RecoveryGeneration++;
+            if (ext->ControllerFailed) {
+                ext->RecoveryRequested = 1;
+                ext->RecoveryDeliveriesLost++;
+                ext->RecoveryFailuresConsecutive++;
+                XhciLogNoteLocked(ext, "ctrl.recover.lost",
+                                  ext->RecoveryDeliveriesLost);
+            } else {
+                ext->RecoveryStaleCallbacks++;
+            }
+        }
+    }
     /* SUSPENDED excludes the arming as well as the callback, and for the reason
      * given at xhciRecoveryCallback: usbport gates its own 500 ms timer on
      * HC_SUSPEND, so this is the narrow window rather than the ordinary case,
@@ -2976,11 +3069,15 @@ static VOID xhciArmRecovery(PXHCI_EXTENSION ext)
         ext->RecoveryFailuresConsecutive < XHCI_RECOVERY_MAX_ATTEMPTS) {
         ext->RecoveryRequested = 0;
         ext->RecoveryArmed = 1;
+        ext->RecoveryArmedPolls = 0;
+        ext->RecoveryGeneration++;
         /* Captured under the lock, with the decision, and not re-read after it
          * is dropped - the rule xhciArmCommandTimer follows, for the same
          * reason: a restart landing in that window would stamp the new start's
-         * epoch onto a callback belonging to the old one. */
+         * epoch onto a callback belonging to the old one. The generation is
+         * this arming's identity against an age-out (above). */
         armed.Epoch = ext->StartEpoch;
+        armed.Generation = ext->RecoveryGeneration;
         armed.Attempt = ext->RecoveryAttempts;
         arm = 1;
     }
@@ -2995,10 +3092,15 @@ static VOID xhciArmRecovery(PXHCI_EXTENSION ext)
      * lock and this driver's lock must never be held across one of usbport's.
      * The return value is discarded for the reason recorded at
      * xhciArmCommandTimer: the service answers 0 on success and 0 on its own
-     * pool-allocation failure, so there is nothing to branch on. A failure there
-     * costs one attempt - RecoveryArmed stays set and no callback arrives -
-     * which is the residual every armed callback in this driver carries, and the
-     * attempt cap bounds it either way.
+     * pool-allocation failure, so there is nothing to branch on. A failure
+     * there leaves RecoveryArmed set with no callback coming, which is what the
+     * age-out at the top of this function exists for: after
+     * XHCI_RECOVERY_DELIVERY_POLLS the arming is released, the request put
+     * back, the loss charged to the consecutive count and a new generation
+     * armed. (An earlier comment here said the loss "costs one attempt" and
+     * "the attempt cap bounds it either way"; neither was true - attempts are
+     * counted only when a recovery runs - and the 2026-09-05 audit's F2 is the
+     * record.)
      */
     (VOID)XhciRegPacket.UsbPortRequestAsyncCallback(
         ext, XHCI_RECOVERY_DELAY_MS, &armed, sizeof(armed),
@@ -3008,18 +3110,11 @@ static VOID xhciArmRecovery(PXHCI_EXTENSION ext)
 /*
  * usbport uses this to stamp endpoint state changes and to answer URB frame
  * queries, and it waits for the number to *advance* before confirming some
- * transitions. A constant would therefore be worse than useless. Phase 4
- * returns MFINDEX >> 3 with software rollover extension; until then a counter
- * that only ever increases keeps every such wait bounded.
- *
- * What usbport needs is advancement with *time*, not with calls - so the real
- * MFINDEX >> 3 will answer the same value to several calls inside one 1 ms
- * frame, and that is correct rather than a regression. The host suite's
- * test_registered_frame_number pins this placeholder's exact values, on purpose:
- * it must be rewritten against a model clock in the same change that reads the
- * register, not kept green by incrementing on top of it.
- * docs/contributing/design/03-host-unit-tests.md names the three vectors that replace
- * it, and which one of them is the proof that this callback advances at all.
+ * transitions. The answer is `XhciFrameNumber`'s: MFINDEX's Frame Index,
+ * extended past its eleven bits by a masked delta under the controller lock
+ * (`src/xhci_init.c`), so it advances with *time* rather than with calls and
+ * several calls inside one 1 ms frame read the same value. The host suite
+ * drives it against a model clock.
  *
  * The frame axis is **not** an unlocked counter, and this comment said it was
  * until the second-reader review. `XhciFrameNumber` takes the controller lock around the
@@ -3526,10 +3621,15 @@ static VOID NTAPI xhciAbortTransfer(PVOID miniPortExtension,
     XhciProbeEndpoint(ext, XHCI_PROBE_EVENT_ABORT, NULL,
                       (const XHCI_ENDPOINT *)endpointExtension, 0);
     /*
-     * The minimum that keeps the completion path honest, not task 7a-B.2's
-     * cancellation machine: detach the transfer so nothing can complete it a
-     * second time after usbport has reclaimed its record, and report what it
-     * moved. The ring is left alone - see XhciSlotAbortTransfer.
+     * The synchronous half: detach the transfer by its own identity so nothing
+     * can complete it a second time after usbport has reclaimed its record,
+     * and report what it moved. This callback runs at DISPATCH under a usbport
+     * lock and may not wait for a command, so the ring is not cleaned up here;
+     * XhciSlotAbortTransfer arms the asynchronous half instead - the Stop
+     * Endpoint (which usbport's earlier PAUSED may already have started) and
+     * the Set TR Dequeue Pointer that places the ring past the cancelled TD,
+     * rewritten as No Ops around any surviving work - and the deferred pass
+     * drives it. (An earlier comment here called that half future work.)
      */
     XhciSlotAbortTransfer(ext, (PXHCI_ENDPOINT)endpointExtension,
                           (PXHCI_TRANSFER)transferExtension, completedLength);

@@ -80,7 +80,15 @@ param(
     [string]$Detach = "",
     [switch]$Status,
     [switch]$Shot,
+    # Does NOT shut the guest down. It prints the safe way to do it - from
+    # inside Windows - and the one-line monitor `quit` for a guest already at
+    # "It is now safe to turn off". A qcow2 written by a killed QEMU is a state
+    # this repository has had to recover from.
     [switch]$Shutdown,
+    # Skip the dated safety snapshot a -Boot pass takes before it changes
+    # anything. A fresh (CloneFrom) target sets this itself: the clone IS the
+    # safety there, and a snapshot taken during prep would sit under the stamp
+    # the run reads.
     [switch]$NoSafetySnapshot,
     # Run the pass against a copy on a local disk (-Boot -WorkDir), then copy
     # it back with -CopyBack when the guest has exited cleanly.  Use this when
@@ -89,7 +97,15 @@ param(
     # boot witnessed, which is what -Stamp checks.
     [string]$WorkDir = "",
     [switch]$CopyBack,
+    # Leave the high-speed mouse out of the -Boot preload set. It is normally
+    # present so Windows 98's PnP stack meets a device as it starts and queues
+    # its wizard with the others, which is how the image is taught a class in
+    # one sitting.
     [switch]$NoKeepAlive,
+    # Replace an existing -WorkDir work copy from the vm-dir image, and, with
+    # -Clone, re-clone a fresh target's image over one already there. Reuse is
+    # the default in both places, because the alternative silently overwrites
+    # half-finished work with the stale original.
     [switch]$FreshCopy,
     # Attach a VVFAT transfer drive carrying the qemu xhci98.sys. OFF by
     # default: see the comment on $xferDir - it is the prime suspect for the
@@ -116,17 +132,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "lib\repo.ps1")
 . (Join-Path $PSScriptRoot "lib\monitor.ps1")
 . (Join-Path $PSScriptRoot "lib\qemu.ps1")
 . (Join-Path $PSScriptRoot "lib\counters.ps1")
 . (Join-Path $PSScriptRoot "lib\fresh.ps1")
 
-$repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-function Resolve-RepoPath { param([string]$P)
-    if ([string]::IsNullOrWhiteSpace($P)) { return "" }
-    if ([IO.Path]::IsPathRooted($P)) { return $P }
-    return (Join-Path $repo $P)
-}
+$repo = Get-VmMatrixRepoRoot
 # The same two places run-matrix.ps1 looks, so one config serves both scripts.
 if ($Config -eq "") {
     foreach ($c in @("scripts\vm-matrix\matrix.config.psd1")) {
@@ -400,7 +412,12 @@ if ($Boot) {
         $NoSafetySnapshot = $true
     }
     if (-not $NoSafetySnapshot) {
-        $tag = "pre-phase10-prep-{0}" -f (Get-Date -Format "yyyy-MM-dd")
+        # **Date AND time.** The tag was date-only, so two prep boots on one
+        # day produced two snapshots with the same name - and "revert to the
+        # tag" is then ambiguous, which is the one thing a safety snapshot may
+        # not be. qemu-img accepts the duplicate silently and `qemu-img
+        # snapshot -a <tag>` picks one of them. The 2026-09-07 audit's H25.
+        $tag = "pre-phase10-prep-{0}" -f (Get-Date -Format "yyyy-MM-dd-HHmm")
         Write-Host ("taking a safety snapshot '{0}' of {1}" -f $tag, $image)
         $text = Invoke-NativeText -Exe $qemuImg -Arguments @("snapshot", "-c", $tag, $image)
         if ($LASTEXITCODE -ne 0) { throw ("qemu-img snapshot failed ({0}) - is the image open in another QEMU? {1}" -f $LASTEXITCODE, $text.Trim()) }
@@ -740,6 +757,33 @@ if ($Boot) {
         # taught behind a hub is not taught for the root port the matrix uses.
         Send-Checked -Port $port -Command ("device_add {0},port={1}" -f $specs[$name], $slot) | Out-Null
         Start-Sleep -Milliseconds 400
+
+        #
+        # **THE SCSI ADAPTERS NEED THEIR LUN HERE TOO** (the 2026-09-07 audit's
+        # H23). The `-Attach` path above adds the child and repairs `attached`;
+        # this one did not, so `-Preload bot,uas` put an adapter in the port
+        # that QEMU never electrically attaches - `auto_attach = 0` until a
+        # `scsi-hd` child exists - and Windows saw nothing at all. That is
+        # exactly the failure trap 15 in README.md records, reached through the
+        # door the surrounding comments recommend as how a prep pass should
+        # present devices: the operator reads the silence as "already taught",
+        # and the first run afterwards meets an Add New Hardware Wizard on a
+        # guest nobody is allowed to touch.
+        #
+        if ($children.ContainsKey($name)) {
+            Send-Checked -Port $port -Command ("device_add " + $children[$name]) | Out-Null
+            Start-Sleep -Milliseconds 500
+            $qom = "/machine/peripheral/" + (Get-AttachId -Name $name)
+            $state = ((Get-MonitorText -Port $port -Command ("qom-get {0} attached" -f $qom)) -join " ").Trim()
+            if ($state -match "(?i)\bfalse\b") {
+                Send-Checked -Port $port -Command ("qom-set {0} attached true" -f $qom) | Out-Null
+                Start-Sleep -Milliseconds 500
+                $state = ((Get-MonitorText -Port $port -Command ("qom-get {0} attached" -f $qom)) -join " ").Trim()
+            }
+            if ($state -notmatch "(?i)\btrue\b") {
+                Write-Host ("  *** '{0}' is still not electrically attached ({1}); its wizard will not appear and it is NOT taught." -f $name, $state)
+            }
+        }
     }
     if ($slot -gt 0 -and $isFresh) {
         Write-Host ("{0} device(s) attached BEFORE the driver starts. On a fresh guest with no driver installed yet" -f $slot)

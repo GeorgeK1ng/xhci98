@@ -24,6 +24,132 @@ Do not turn a hypothesis into a settled hardware quirk. Move confirmed design
 rules into the appropriate normative document while keeping the debugging
 history here.
 
+## Proving a control-endpoint reopen on a RELEASE-flavour guest: the QEMU trace bounds it, and a debug-port target confirms the counter
+
+Observed on 2026-09-07 on the XP and Windows 2000 guests, `1.0.2.0` installed
+from the published asset (roadmap task 20.9). The release adds a refusal on
+the control-endpoint open path, so what needed reading was the opposite of
+the refusal: that a LEGITIMATE reopen still succeeds. The published release
+flavour writes nothing to the debug port, so the driver's own counters are
+unreadable on the guest the asset installs.
+
+Making the guest reopen rather than enumerate. Disable the controller in
+Device Manager and re-enable it, with a device still attached at QEMU. The
+disable is a real teardown - root hub, the whole HID node and the mouse all
+vanished from Device Manager, while QEMU still listed the device as attached
+- so the re-enable has to reopen the control endpoint rather than process a
+fresh plug. It came back line for line, no replug at any point.
+
+Two sources, in order of strength:
+
+- The QEMU trace, on the release flavour: enable, address and configure
+  commands recorded after the teardown sweep. This bounds it from below
+  rather than proving it, but the bound is tight - a wrongly refused reopen
+  fails the control endpoint, and no Configure Endpoint could follow it.
+- The counters, on a target whose debug port does work. The same sequence on
+  the Windows 2000 guest read `DevicesReopened` 1 and every refusal counter
+  0, both before the disable and after the enable. `DevicesReopened` is
+  incremented inside the branch the guard protects, so this retires the
+  inference the trace rested on. The sequence unloads and reloads the driver,
+  so the counters reset across it: those are two independent clean
+  traversals, not one reading taken twice.
+
+The reusable part: a RELEASE-flavour reading is not necessarily a blind one.
+Pick the target whose stack survives the door you need (Windows 98 under NUSB
+bugchecks on controller disable, which is why that target cannot take this
+reading at all), take the trace on the guest that has the published binary,
+and repeat the sequence on a debug-port target for the counter. Together they
+cover a guard that reads only this driver's own record state, never which
+usbport build called it.
+
+## The Windows 98 USB Audio replug row fails only with a second guest on the host, and four readings on one image, stamp and binary are what showed it
+
+Observed between 2026-09-06 and 2026-09-07 on the development host, QEMU
+11.0.0 under TCG, `fresh-2a.img` at `base-1.0.1.0-qemu` and later
+`base-1.0.2.0-qemu`, `run-matrix.ps1 -PostRelease` (roadmap tasks 20.7,
+20.8 and 20.9). The `usb-audio/fs` REPLUG leg read FAIL where Phase 19 had
+read PASS: the second arrival was never addressed at all, with no Insert
+Disk prompt, and with every fault and refusal counter in the report at
+zero. Phase 16's failure of the same row had a prompt, so the verdict
+matched an existing limitation but the signature did not.
+
+What the driver did, from QEMU's `usb_xhci_port_*` and `usb_port_*` traces
+with the debug console beside them. QEMU attached the second instance
+exactly once (`usb_port_attach`, port 2, full speed) and raised one connect
+change. The driver read PORTSC `0x000206e1`, acknowledged CSC in the
+register, latched the change and announced it once; PORTSC was then read
+five times, `0x000006e1` every time (connected, Polling, not enabled, no
+change bits), and no PR write followed. Usbport queried hub status, cleared
+one change bit and issued no reset. The next port event is the harness's own
+detach. `RH_GetPortStatus` answers the correct `0x0501` for that PORTSC,
+`RH refusals` never moves, and every refusal site prints its first sample,
+so no reset was refused - usbport simply never asked for one. In a passing
+trace the hub polls the port nine times after the connect change and then
+issues the reset; in a failing one it polls five times and stops.
+
+The trigger is host contention from a second concurrent emulator, not
+anything the driver does:
+
+- The audio group run by itself passes both legs, repeatedly, including
+  with the QEMU window forced to the foreground and forced minimized, so
+  the window state is not it.
+- The same group run beside a second QEMU guest fails, whether that guest
+  is running its own matrix or merely booted and idle.
+- The strongest reading is an A/B twenty minutes apart on one image, one
+  stamp, one binary and one host (2026-09-07): started in the paired shape,
+  the row failed on the same signature; de-paired, `2a-fresh` alone from
+  15:09:12 with `2b-fresh` started only after the audio group had cleared,
+  both legs PASS.
+- Moving the audio group to the front of `matrix.psd1`, which had been the
+  remedy on 2026-09-06, does not by itself hold: the paired attempt above
+  failed with the group already first.
+
+Refuted along the way: the removal-tail timing hypothesis (usbhub's tidy-up
+after the first instance clearing the connect change the arrival had
+latched) - raising the replug delay from about 8 s to 15 s changes nothing;
+a synthetic 91 percent host CPU load alone does not reproduce it; and a
+sustained guest clock slowdown is not it either, the idle health-poll rate
+being identical alone and beside an idle second guest (1.43 polls/s, the
+guest millisecond clock at about 0.73x wall in both). What is left is
+transient host scheduling inside the replug's sub-second window.
+
+One caveat keeps this short of a full explanation: a full solo
+`-Target 2a-fresh` run also failed the row once, its audio group being the
+fifth guest boot of a near-hour run, and why a long solo run reaches the
+same state as a paired one is not established. A Codex read of the code
+found no driver defect and no Phase 20 change on any executable path that
+gates a root-port reset.
+
+The rule: when a matrix row fails with every driver counter at zero and the
+trace shows the stack never asking for the operation, suspect the host
+before the driver, and settle it with an A/B on the same image, stamp and
+binary rather than with more runs of the same shape. The one reading that
+would still sharpen this is the order of usbport's port-status query
+against its `C_PORT_CONNECTION` clear, which needs an unbudgeted print of
+`RH_GetPortStatus` and `RH_ClearFeaturePortConnectChange` or the log ring
+read with `XHCISNAP` before the group's guest is discarded; every such site
+has spent its print budget by then, so their absence in the window is not
+evidence. The user-facing statement is the USB Audio bullet in the release
+notes; the roadmap tasks record which run is which.
+
+## Test the actual shell chain when a build loses a PowerShell command
+
+Observed on 2026-09-07 on the Windows development host, PowerShell 7.6.5
+parent, `cmd /c scripts\build-driver.cmd all`. The evidence-manifest
+self-test failed because `Get-FileHash` was not recognised. A direct
+`powershell -NoProfile -Command 'Get-Command Get-FileHash'` from that same
+parent succeeded, so that probe alone would have repeated the earlier
+"not reproduced" disposition in roadmap 20.6.
+
+The intervening `cmd` is decisive: `cmd /c` launching the same PowerShell
+probe retained the PS7 user, system and runtime module directories ahead
+of the Windows PowerShell ones, and failed. The direct child had only
+Windows PowerShell paths. `build-driver.cmd` now sets `PSModulePath` to
+the Windows PowerShell system and Program Files module directories within
+its `setlocal`; the parent process and machine configuration are untouched.
+Use the full build entry point to verify this fix, not a direct child that
+does not inherit the failing environment.
+
 ## The host's sound card reached into an unattended run through an unnamed audio backend
 
 Environment: host `FW-W11P-YKM`, QEMU 11.0.0 (scoop), the `1.0.1.0`
@@ -147,6 +273,13 @@ through the same `Services\USB` query table the SweetLow rebuild carries.
 With the value set by hand (`Services\USB` does not exist on a stock XP
 install) the suspend did not happen and the hot-plugged mouse bound. The
 1.0.1.0 INF writes the value on both paths.
+
+Qualification, 2026-09-05: "Windows 2000's native usbport never idles this
+controller" in the paragraph above was the repository's assumption at the
+time, generalised from the Phase 3 spike's observation window, not a
+measurement; the owner's checks of 2026-09-05 contradict it. The XP
+observation stands as recorded; the generalisation does not
+(roadmap Phase 20, F18).
 
 Rules this earns:
 
@@ -569,8 +702,9 @@ against `PollClockMs`: 36-80 ms, 54.9 ms over the whole boot, `PollClockStalls`
 and the commands it pre-empted were slower than roughly 2.3 s.
 
 The consequences were invisible for three boots. 2.3-5.1 s is at or under
-`XHCI_COMMAND_TIMEOUT_MS` = 5,000, the watchdog this backstop was sized to sit
-12 s behind, so it pre-empted the 5,000 ms command watchdog on every boot.
+`XHCI_COMMAND_TIMEOUT_MS` = 5,000, where the 32 s this backstop was meant to
+be sits 12 s clear of the ladder's 20 s legitimate worst case, so it pre-empted
+the 5,000 ms command watchdog on every boot.
 That is what `CommandsTimedOut 0` across 76, 635 and 123 commands says, while
 `CommandTimeoutArrivals` showed 633 of 635 watchdogs arriving. And the driver
 escalated to a controller reset 33 times in 15 plug cycles.
@@ -1023,7 +1157,8 @@ nothing. No reading needs re-checking, and stage T1's gate value is current.
 
 ### What is proven, and what the alarm rested on
 
-The alarm rested on a proxy. `src/xhci.h` is ~4,000 lines and mostly prose;
+The alarm rested on a proxy. `src/xhci.h` is thousands of lines (about 4,000
+when this was written, 7,992 at `1.0.2.0`) and mostly prose;
 commits to it are a poor stand-in for changes to `XHCI_EXTENSION`. Extracting
 the struct at both ends of the range and diffing its non-comment lines gives
 446 against 446, identical. Every difference in the eight commits (not ten)
@@ -1307,8 +1442,9 @@ already in the fleet.
 What it does not change: the fleet's xHCI coverage argument is unmoved. The
 P14s is a third clean Intel controller beside the E460's, so it confirms
 rather than extends, and no quirky Intel silicon is in the fleet at all. It
-says nothing about Windows 2000, which bugchecks in Setup on this machine; the
-era wall recorded there stands, and this is not a reason to retry it.
+says nothing about Windows 2000, which bugchecks in Setup on this machine; no
+cause was investigated and no bugcheck code captured, and this is not a reason
+to retry it (`AGENTS.md`, "Observed on both").
 
 Where the consequence is owned: roadmap batch 13-E's heading and
 `docs/contributing/runs/run-13e.md`'s closing section. The machine owns no
@@ -2316,6 +2452,16 @@ Measured on the 2a guest, one boot each:
 Refresh, and `CheckCallbacks` climbing continuously instead of freezing. So
 the defect is fixed by one `AddReg` line, on the Windows 98 path only, with
 no driver code at all.
+
+Postscript, 2026-09-06 (roadmap Phase 20, F18): Windows 2000 SP4's own stack
+was not seen idling this controller in the VM, value or no value, in the
+conditions `build-and-test.md` records on both HALs, and the same kind of
+string pass suggests why, unconfirmed: the idle request comes from the hub
+driver, SP4's `usbhub.sys` carries no selective-suspend string, and the hub
+driver NUSB puts above this usbport, `usbhub20.sys` 5.00.2195.6891, does.
+The "never idles" sentence this project carried for weeks agreed with every
+run and was still unmeasured; the measurement now exists, and it is bounded
+by its conditions.
 
 ### Rules
 
@@ -3422,9 +3568,10 @@ That is where no-double-completion comes from.
 
 The change was written, run and reverted: it works, and its shape was wrong.
 Making the short packet terminal for a Normal TD does end the receive, and
-twelve existing vectors then fail (`test_ring.c`
-954/958/959/960/969/1040/1041/1043, `test_xfer.c` 1305/1312, `test_init.c`
-12135/12136), all of them asserting the old behaviour, so the direction is
+twelve existing vectors then fail (eight in `test_ring.c`, two in
+`test_xfer.c`, two in `test_init.c`; the line numbers this entry first named
+have long since moved, and the vectors are found by running the suite), all of
+them asserting the old behaviour, so the direction is
 confirmed by the vectors that should object. The flaw was in the ring half:
 `CanRetire` was widened so a Short Packet retires mid-TD, but the ring layer
 cannot make that call. It cannot tell a Normal TD from a control transfer's
@@ -6580,6 +6727,17 @@ callback contracts or runtime behaviour, and no XP validation follows from
 it. XP stays a best-effort secondary target with no VM and no checkpoint
 (`docs/usb-xhci-info/win98-wdm.md`, "What about Windows XP?").
 
+Amended 2026-09-03: the "no VM and no checkpoint" half is superseded. The
+owner decided that morning that 32-bit Windows XP is a fourth target of the
+same standing as Windows ME, supported in virtual machines, and a QEMU XP
+Professional SP3 guest exists (`AGENTS.md`; `build-and-test.md`, "Windows XP
+target VM"). What is unchanged is the rest: it carries no checkpoint tax,
+nothing waits on an XP observation, "observed on both" does not include it,
+and it has never run on real hardware. The paragraph's own claim - that
+packet format alone establishes nothing about XP callback contracts or
+runtime behaviour - also stands; the XP validation that followed came from
+the guest, not from this reading.
+
 ### Affected documentation
 
 `docs/usb-xhci-info/usbport-miniport-interface.md` "Target ABI record" (all
@@ -7202,7 +7360,11 @@ targets have the same latent hole; base Win98 SE ships `usbd.sys`, but that
 must be verified per machine rather than assumed.
 
 Consequence for Phase 3: check `usbd.sys` exists before the miniport spike,
-and carry it in `xhci98.inf`'s `CopyFiles`. Otherwise the root hub fails to
+and carry it in `xhci98.inf`'s `CopyFiles`. (Superseded at 1.0.0.1 as to the
+second half only: the file is still delivered by the INF, but through
+`LayoutFile` out of the OS's own install source rather than off this
+project's media. The hole this paragraph identifies is the same one, and it
+is still the reason a row exists.) Otherwise the root hub fails to
 load with a `0xc0000034` that names `usbhub20.sys` and reads as "the
 miniport didn't work", a false no-go on the architecture gate.
 
@@ -7432,6 +7594,15 @@ regardless of controllers, so `xhci98.inf` (binding `PCI\CC_0C0330`) can
 rely on the stack being there. Bundling the usbport files in `xhci98.inf`'s
 own `CopyFiles` is now an optional/defensive measure for a hypothetical
 non-NUSB host, not the hard requirement the earlier note claimed.
+
+Amended 2026-09-02: "optional" is superseded and the option is gone. The
+media carries no Microsoft file at all since 1.0.0.1, and the INF gate's
+`OS-MEDIA` and `PKG-MSFILE` rules refuse one on the media or in a staged
+package under any name. What the INF does instead is have the setup engine
+fetch each file from the OS's own install source through
+`LayoutFile=layout.inf` with flag 16, so the delivery is real rather than
+defensive and the file is still never overwritten. `AGENTS.md` and
+`legal-provenance.md` section 5 record the decision.
 
 ### Reusable rules
 

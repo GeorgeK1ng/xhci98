@@ -14,14 +14,25 @@ rem   4. the packager's regression tests - it decides where each file lands on
 rem      the install media, and a package staged at one path but authenticated
 rem      at another verifies nothing
 rem   5. the QEMU launcher regression tests - a stale append-only trace can
-rem      falsely attribute an earlier DriverEntry to the current binary
-rem   6. test\run-host-tests.cmd - the pure-core suite. It runs before the DDK
+rem      falsely attribute an earlier DriverEntry to the current binary, and
+rem      two launchers sharing a monitor port cannot both run
+rem   6. the vm-matrix verdict self-tests - a matrix that reads a refusal as a
+rem      pass makes every later FAIL and NODRIVER word untrustworthy
+rem   7. the tracked batch files' line endings - MS-DOS 7.1 COMMAND.COM can
+rem      fail on an LF-only .BAT, and the field wrappers are .BAT files
+rem   8. the XHCISNAP report self-test, when that EXE has been built (it has a
+rem      build.cmd of its own, and a clone without Open Watcom still runs
+rem      everything else here)
+rem   9. test\run-host-tests.cmd - the pure-core suite. It runs before the DDK
 rem      builds, not after: it compiles the same core files in seconds, so a
 rem      bad carve, ring or PORTSC constant should not cost two full builds
 rem      first
-rem   7. `build` for each requested flavor, with the compile-time layout and
+rem  10. `build` for each requested flavor, with the compile-time layout and
 rem      ABI asserts in src\xhci.h / src\xhci_usbport.h
-rem   8. scripts\import-gate\check-imports.ps1 on each linked binary
+rem  11. scripts\import-gate\check-imports.ps1 on each linked binary, then
+rem      scripts\check-flavour-marker.ps1 on it - which is what says the
+rem      binary in objfre really is the release flavour and not a checked
+rem      build staged under the wrong name
 rem
 rem Any failure stops the run. scripts\local\ddk-debug.cmd still exists for an
 rem interactive DDK prompt, but a binary built that way has not been through the
@@ -81,6 +92,11 @@ rem Exit codes: 0 = built and gated, 1 = failure, 2 = host tests inconclusive
 rem (a blocked exe launch, not a test failure - just run it again).
 
 setlocal
+
+rem A pwsh -> cmd -> powershell.exe launch retains PS7's module paths, unlike
+rem pwsh launching powershell.exe directly. Its Utility module hides the 5.1
+rem Get-FileHash command used by the gates. Scope the fix to this build.
+set "PSModulePath=%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules;%ProgramFiles%\WindowsPowerShell\Modules"
 
 rem Normalize the repo root rather than carrying "scripts\.." through every
 rem derived path: DDKROOT is one of them and reaches setenv.bat, whose own
@@ -204,6 +220,31 @@ echo === QEMU launcher self-tests ===
 powershell -NoProfile -ExecutionPolicy Bypass -File ^
     "%REPO%\scripts\test-qemu-launchers.ps1"
 if errorlevel 1 goto qemutestfail
+
+rem The verdict evaluator's suite (design record 06) and the batch-file
+rem line-ending check were not wired in here until the 2026-09-05 audit's
+rem smaller items; a build that ran every other self-test could still ship a
+rem matrix that read a refusal as a pass. Both are guestless and quick.
+echo.
+echo === VM matrix verdict self-tests ===
+powershell -NoProfile -ExecutionPolicy Bypass -File ^
+    "%REPO%\scripts\vm-matrix\selftest.ps1"
+if errorlevel 1 goto matrixtestfail
+
+echo.
+echo === batch-file line endings ===
+powershell -NoProfile -ExecutionPolicy Bypass -File ^
+    "%REPO%\xhciqual\test\check-bat-eol.ps1"
+if errorlevel 1 goto eoltestfail
+
+rem The snapshot reader's report path, when its EXE has been built (it is a
+rem separate build.cmd, and a clone without Open Watcom still has this one).
+if exist "%REPO%\xhcisnap\XHCISNAP.EXE" (
+    echo.
+    echo === xhcisnap report self-test ===
+    call "%REPO%\xhcisnap\selftest.cmd"
+    if errorlevel 1 goto snaptestfail
+)
 
 echo.
 echo === host tests ===
@@ -376,6 +417,16 @@ rem the second tripped over `|` inside a caret-continued quoted line.
 powershell -NoProfile -ExecutionPolicy Bypass -File ^
     "%REPO%\scripts\check-flavour-marker.ps1" -Image "%OUTSYS%" -Flavour %FLAVOR%
 if errorlevel 1 goto flavourmissing
+
+rem Record which sources this binary came from, beside it. make-release.ps1
+rem checks it and refuses to publish a .sys the tree can no longer reproduce -
+rem the driver's equivalent of the "EXE newer than its own sources" refusals it
+rem already makes for XHCIQUAL and XHCISNAP (the 2026-09-07 audit's H13). It is
+rem content rather than timestamps, because an mtime moves on a checkout or a
+rem comment-only commit; scripts\source-stamp.ps1 says why at length.
+powershell -NoProfile -ExecutionPolicy Bypass -File ^
+    "%REPO%\scripts\source-stamp.ps1" -Write "%REPO%\src\%OBJDIR%\i386"
+if errorlevel 1 goto stampfailed
 endlocal
 exit /b 0
 
@@ -387,6 +438,17 @@ echo BUILD_ALT_DIR and src\xhci_dispatch.c emits the string; DriverEntry reads
 echo it so the linker cannot drop it. A binary that cannot be identified from
 echo the file is one a user cannot report against and one the packager cannot
 echo refuse by name.
+endlocal
+exit /b 1
+
+:stampfailed
+echo.
+echo ERROR: could not record the source stamp beside the %FLAVOR% image.
+echo scripts\source-stamp.ps1 hashes every file src\sources names plus every
+echo header in src\, and writes the list beside the binary so make-release.ps1
+echo can refuse to publish a .sys the tree can no longer reproduce. A build
+echo that cannot write it has a src\sources this script cannot read, or an
+echo obj directory it cannot write to.
 endlocal
 exit /b 1
 
@@ -619,6 +681,27 @@ echo.
 echo ERROR: the install-media packager's self-tests failed, so any package it
 echo builds is untrustworthy - including where it puts each file and whether
 echo a Microsoft file has crept back onto the media.
+endlocal
+exit /b 1
+
+:matrixtestfail
+echo.
+echo ERROR: the VM matrix verdict self-tests failed, so a matrix run's PASS,
+echo FAIL and NODRIVER words cannot be trusted. Fix scripts\vm-matrix first.
+endlocal
+exit /b 1
+
+:eoltestfail
+echo.
+echo ERROR: a tracked batch file is not CRLF. MS-DOS 7.1 COMMAND.COM can fail
+echo to find goto labels in an LF-only file, silently breaking its error paths.
+endlocal
+exit /b 1
+
+:snaptestfail
+echo.
+echo ERROR: xhcisnap's report self-test failed, so a dump's "send this" line
+echo cannot be trusted to mean the report was written in full.
 endlocal
 exit /b 1
 

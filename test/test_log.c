@@ -41,34 +41,7 @@
 #include <string.h>
 #include "../src/xhci_compat.h"
 #include "../src/xhci_log.h"
-
-static int failures;
-static int checks;
-
-#define CHECK(cond, what) check_impl((cond) ? 1 : 0, (what), __LINE__)
-
-static void check_impl(int cond, const char *what, int line)
-{
-    checks++;
-    if (!cond) {
-        failures++;
-        printf("FAIL %s:%d: %s\n", "test_log.c", line, what);
-    }
-}
-
-#define CHECK_EQ(got, want, what) \
-    check_eq_impl((unsigned long)(got), (unsigned long)(want), (what), __LINE__)
-
-static void check_eq_impl(unsigned long got, unsigned long want,
-                          const char *what, int line)
-{
-    checks++;
-    if (got != want) {
-        failures++;
-        printf("FAIL %s:%d: %s (got %lu, want %lu)\n",
-               "test_log.c", line, what, got, want);
-    }
-}
+#include "test_harness.h"
 
 /* ------------------------------------------------------------------ */
 /* The accounting nets                                                 */
@@ -85,11 +58,164 @@ static unsigned long appendCallsEver;
 static unsigned long drained;
 static unsigned long drainedEver;
 
+/*
+ * **The byte-conservation net this file's header promises, which until the
+ * 2026-09-07 audit's G7 did not exist.** `drained` was reset by `resetLog`
+ * and never read by anything; there was no appended-bytes accumulator and no
+ * identity assertion, so the second of the two identities the header names -
+ * "what the drains handed back plus what the ring still holds plus what was
+ * dropped equals what the appends put in" - was described and not enforced.
+ *
+ * It is stated as an invariant over the ring's own three quantities rather
+ * than over a second transcription of the record format, because the format
+ * is pinned byte for byte elsewhere in this file and restating it here would
+ * only be a third copy to keep in step. The quantity
+ *
+ *     log.Used + log.BytesDropped + (bytes this vector's drains returned)
+ *
+ * is the total number of bytes the ring has ever been handed in this vector.
+ * Every `xhciLogPut` raises exactly one of `Used` or `BytesDropped`, and every
+ * drain must return exactly as many bytes as it takes out of `Used`. So the
+ * quantity may only ever go UP, and by exactly the bytes put. A drain that
+ * emptied the ring while reporting fewer bytes - the regression the header is
+ * about, and the one that would make a flush claim to have published a log it
+ * silently ate - shows up here as a decrease, at the drain that caused it.
+ *
+ * `ringBytesIn` accumulates the increases and `noteRingBytes` reports a
+ * decrease at the call that caused it, which localises a drain that ate what
+ * it took.
+ *
+ * **That much is a one-sided net, and on its own it is circular** - the
+ * quantity it accumulates and the quantity it compares against are the same
+ * measurement, so it can only ever say "this did not go down". A put that
+ * wrote FEWER bytes than the record it was handed raises neither an
+ * independent expectation nor a failure: the total simply grows by less than
+ * it should, and nothing in the ring's own three quantities knows what "should"
+ * was. So `expectedBytesIn` is accumulated from the APPEND'S ARGUMENTS,
+ * through the record format, and never from the ring.
+ *
+ * The header's argument against restating the format still holds for the
+ * record's BYTES - those are pinned character by character in the vectors
+ * below and are not restated here. What is restated is only its LENGTH, which
+ * is the smallest thing that can be independent, and `expectedRecordBytes`
+ * below is the whole of it.
+ */
+static unsigned long ringBytesIn;
+static unsigned long ringBytesInLast;
+static unsigned long ringBytesInEver;
+static unsigned long expectedBytesIn;
+static unsigned long expectedBytesInEver;
+static unsigned long ringConservationChecks;
+static unsigned long ringConservationFailures;
+
+/*
+ * The length of the record `XhciLogAppend(label, value, hasValue)` writes,
+ * derived from the arguments alone: the label capped at XHCI_LOG_MAX_RECORD,
+ * then `=` and eight hex digits if a value survived the cap, then CRLF. A
+ * label that hit the cap loses its value - src/xhci_log.c says why - so the
+ * cap decides the value's presence here as well.
+ */
+static unsigned long expectedRecordBytes(const char *label, ULONG hasValue)
+{
+    unsigned long n;
+    unsigned long len;
+
+    len = 0;
+    while (label[len] != '\0') {
+        len++;
+    }
+    if (len > (unsigned long)XHCI_LOG_MAX_RECORD) {
+        n = (unsigned long)XHCI_LOG_MAX_RECORD;   /* truncated: no value */
+    } else {
+        n = len;
+        if (hasValue) {
+            n += 1 + 8;
+        }
+    }
+    return n + 2;                                  /* CRLF */
+}
+
+static void noteRingBytes(int line)
+{
+    unsigned long live;
+
+    live = (unsigned long)log.Used + log.BytesDropped + drained;
+    ringConservationChecks++;
+    if (live < ringBytesInLast) {
+        ringConservationFailures++;
+        printf("FAIL %s:%d: the ring lost %lu byte(s): %lu handed in, %lu "
+               "accounted for now\n",
+               "test_log.c", line, ringBytesInLast - live, ringBytesInLast,
+               live);
+        failures++;
+    } else {
+        ringBytesIn += live - ringBytesInLast;
+        ringBytesInEver += live - ringBytesInLast;
+    }
+    ringBytesInLast = live;
+}
+
+/*
+ * `extra` is the caller's declaration of appends this file did not make - the
+ * three XhciLogFlushBegin writes - whose lengths this file cannot derive. With
+ * any of those in the vector the identity weakens to an inequality, which is
+ * still one-sided against the failure that matters: bytes the ring was handed
+ * and cannot account for.
+ */
+static void checkByteConservation(unsigned long extra, const char *where)
+{
+    unsigned long live;
+
+    live = (unsigned long)log.Used + log.BytesDropped + drained;
+    check_eq_impl(live, ringBytesIn, where, __FILE__, __LINE__);
+    if (extra == 0) {
+        check_eq_impl(live, expectedBytesIn, where, __FILE__, __LINE__);
+    } else if (live < expectedBytesIn) {
+        printf("FAIL %s: the ring accounts for %lu byte(s), but the appends "
+               "this file made are worth %lu\n", where, live, expectedBytesIn);
+        failures++;
+    }
+}
+
 static void appendOne(const char *label, ULONG value, ULONG hasValue)
 {
+    ULONG before;
+
     appendCalls++;
     appendCallsEver++;
+    before = log.Appends;
     XhciLogAppend(&log, label, value, hasValue);
+    /*
+     * Only a RECORDED append is worth bytes. A suppressed one, a NULL label
+     * and a NULL log all leave `Appends` where it was, and `Appends` is itself
+     * held to the call count by `checkAppendIdentity` - so this reads the one
+     * fact it needs from a counter another net already pins, rather than
+     * re-deriving the gate ladder here.
+     */
+    if (log.Appends != before) {
+        expectedBytesIn += expectedRecordBytes(label, hasValue);
+        expectedBytesInEver += expectedRecordBytes(label, hasValue);
+    }
+    noteRingBytes(__LINE__);
+}
+
+/* The address entry point reaches the same formatter with hasValue set, so it
+ * is accounted for the same way. It goes through here rather than being called
+ * directly, or the vectors that use it hand the ring bytes the byte identity
+ * has no expectation for. */
+static void appendAddressOne(const char *label, ULONG value)
+{
+    ULONG before;
+
+    appendCalls++;
+    appendCallsEver++;
+    before = log.Appends;
+    XhciLogAppendAddress(&log, label, value);
+    if (log.Appends != before) {
+        expectedBytesIn += expectedRecordBytes(label, 1);
+        expectedBytesInEver += expectedRecordBytes(label, 1);
+    }
+    noteRingBytes(__LINE__);
 }
 
 static ULONG drainInto(UCHAR *out, ULONG capacity)
@@ -99,6 +225,7 @@ static ULONG drainInto(UCHAR *out, ULONG capacity)
     n = XhciLogDrain(&log, out, capacity);
     drained += n;
     drainedEver += n;
+    noteRingBytes(__LINE__);
     return n;
 }
 
@@ -141,7 +268,11 @@ static ULONG drainAll(UCHAR *out, ULONG capacity, ULONG chunkSize)
 static void checkAppendIdentity(unsigned long extra, const char *where)
 {
     check_eq_impl((unsigned long)log.Appends + log.Suppressed,
-                  appendCalls + extra, where, __LINE__);
+                  appendCalls + extra, where, __FILE__, __LINE__);
+    /* The byte identity rides the same call sites as the record one, so a
+     * vector written later cannot opt out of either. */
+    noteRingBytes(__LINE__);
+    checkByteConservation(extra, where);
 }
 
 static void resetLog(void)
@@ -155,6 +286,9 @@ static void resetLog(void)
     }
     appendCalls = 0;
     drained = 0;
+    ringBytesIn = 0;
+    ringBytesInLast = 0;
+    expectedBytesIn = 0;
     log.Enabled = 1;
     /*
      * **Two switches now, because task 13-L.2 separated them.** `Enabled` is
@@ -563,6 +697,23 @@ static void testFailedHandoverEmptiesTheRing(void)
     CHECK_EQ(log.Flushes, 0, "a failed hand-over is not a flush");
     CHECK_EQ(log.FlushFailures, 1, "it is a failure");
     CHECK_EQ(log.FlushBytes, 0, "and moved no bytes");
+
+    /*
+     * The half that zero cannot show (G11): `FlushBytes` is accumulated
+     * UNCONDITIONALLY, before the verdict, so a short delivery contributes the
+     * part that really left while still counting as a failure. Reporting 0
+     * bytes taken agrees with an implementation that only accumulates on
+     * success, so a nonzero one has to be asserted too.
+     */
+    XhciLogFlushEnd(&log, 7, 0);
+    CHECK_EQ(log.Flushes, 0, "still not a flush");
+    CHECK_EQ(log.FlushFailures, 2, "a second failure");
+    CHECK_EQ(log.FlushBytes, 7,
+             "and the seven bytes that did leave are counted anyway");
+    XhciLogFlushEnd(&log, 5, 1);
+    CHECK_EQ(log.Flushes, 1, "a successful hand-over is a flush");
+    CHECK_EQ(log.FlushFailures, 2, "and adds no failure");
+    CHECK_EQ(log.FlushBytes, 12, "with its bytes added to the same total");
     CHECK_EQ(log.Used, 0, "the ring is empty whatever the sink said");
 
     /* The next record still fits, which is the property that matters. */
@@ -706,7 +857,7 @@ static void testVerbosityLadder(void)
         CHECK_EQ(log.VerbosityRefused, 0, "an in-range level is not refused");
         check_eq_impl(log.Enabled,
                       (level >= XHCI_LOG_VERBOSITY_RING) ? 1UL : 0UL,
-                      "recording is on at the ring rung and above", __LINE__);
+                      "recording is on at the ring rung and above", __FILE__, __LINE__);
     }
     /*
      * **The top of the ladder is asserted rather than assumed.** A merge that
@@ -791,7 +942,7 @@ static void testChannelConsentIsRungZero(void)
         check_eq_impl((log.Verbosity == XHCI_LOG_VERBOSITY_OFF) ? 1UL : 0UL,
                       (level == 0) ? 1UL : 0UL,
                       "the channel is shut at rung 0 and open above it",
-                      __LINE__);
+                      __FILE__, __LINE__);
     }
 
     /* The sink does not open the channel, and the channel does not select a
@@ -831,8 +982,7 @@ static void testAddressRecordsNeedTheTopRung(void)
         log.Enabled = 0;
         (void)XhciLogApplySwitches(&log, level, 0);
 
-        XhciLogAppendAddress(&log, "start", 0x8054C000UL);
-        appendCalls++;
+        appendAddressOne("start", 0x8054C000UL);
 
         if (level >= XHCI_LOG_VERBOSITY_FULL) {
             CHECK(log.Used > 0, "the top rung records an address");
@@ -841,10 +991,10 @@ static void testAddressRecordsNeedTheTopRung(void)
         } else {
             check_eq_impl(log.Used, 0,
                           "no level below the top records an address",
-                          __LINE__);
-            check_eq_impl(log.Appends, 0, "nothing was appended", __LINE__);
+                          __FILE__, __LINE__);
+            check_eq_impl(log.Appends, 0, "nothing was appended", __FILE__, __LINE__);
             check_eq_impl(log.Suppressed, 1,
-                          "and the refusal is accounted for", __LINE__);
+                          "and the refusal is accounted for", __FILE__, __LINE__);
         }
         checkAppendIdentity(0, "address tier");
     }
@@ -859,8 +1009,7 @@ static void testAddressRecordsNeedTheTopRung(void)
     log.Enabled = 0;
     (void)XhciLogApplySwitches(&log, XHCI_LOG_VERBOSITY_RING, 0);
     log.Publishing = 1;
-    XhciLogAppendAddress(&log, "start", 0x8054C000UL);
-    appendCalls++;
+    appendAddressOne("start", 0x8054C000UL);
     log.Publishing = 0;
     CHECK_EQ(log.Used, 0, "the flush's bypass does not open the address tier");
     CHECK_EQ(log.Suppressed, 1, "the refusal still counts");
@@ -971,6 +1120,14 @@ int main(void)
     CHECK(appendCallsEver > 100, "the append identity measured real appends");
     CHECK(drainedEver > XHCI_LOG_RING_BYTES,
           "the drain accounting measured a full ring's worth and more");
+    CHECK_EQ(ringConservationFailures, 0,
+             "no drain ever took a byte out of the ring without returning it");
+    CHECK(ringConservationChecks > 100,
+          "the byte-conservation net actually ran");
+    CHECK(ringBytesInEver > XHCI_LOG_RING_BYTES,
+          "and saw more than a ring's worth of bytes handed in while it did");
+    CHECK(expectedBytesInEver > XHCI_LOG_RING_BYTES,
+          "and that many were expected from the appends' own arguments");
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures;

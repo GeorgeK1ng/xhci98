@@ -458,6 +458,14 @@ static VOID xhciCommandInvalidateLocked(PXHCI_EXTENSION ext)
      * exactly the window a quiesce arriving mid-pump lands in. */
     XhciSlotCommandLost(ext);
     ext->CommandGeneration++;
+    /*
+     * A rewritten No Op still waiting for its completion is given up with the
+     * ring: every path through here rebuilds the command ring before the
+     * engine runs again, and a marker that outlived the rebuild would match
+     * the first new command to land at that address and retire its completion
+     * as the No Op's (the Phase 20 review's first finding).
+     */
+    ext->CommandNoOpRewrittenPA = 0;
 }
 
 /* IRQL: <= DISPATCH_LEVEL. No wait is performed while the lock is held. */
@@ -575,12 +583,22 @@ ULONG XhciControllerHealthPoll(PXHCI_EXTENSION ext)
      * controller, so this is the poll docs/contributing/implementation-invariants.md, "Fatal
      * Errors" has required on every invocation since before the callback existed.
      *
-     * Neither bit is acknowledged. HSE is RW1C and clearing it would destroy the
-     * one durable record of why the controller was failed, on a path that has
-     * already decided not to retry in place; HCE cannot be cleared by software
-     * at all. The transition is what escalates - ControllerFatal latches - so a
-     * bit that stays set for the life of the driver does not ask usbport to
-     * queue a reset every 500 ms.
+     * Neither bit is acknowledged here. HSE is RW1C and clearing it would
+     * destroy the one durable record of why the controller was failed before
+     * the recovery has run; HCE cannot be cleared by software at all. The
+     * transition is what escalates - ControllerFatal latches - so the polls
+     * still admitted before ResetController closes admission (and every poll,
+     * should that call never arrive) do not ask usbport to queue a reset every
+     * 500 ms; once ControllerFailed is set the poll declines above, before
+     * reading. The latch reopens inside the reinitialization, once
+     * its HCRST has completed and the post-reset capability check has passed
+     * (XhciInitController clears it with ControllerFailed, before the steps
+     * that can still refuse): that HCRST has cleared the bits the latch
+     * answered, so a later report is a new transition and escalates again. A
+     * refusal before the HCRST leaves the latch standing; one after the clear
+     * on the recovery path (XhciRecoverController) re-latches ControllerFailed
+     * and is charged to the recovery budget, and a fresh fatal after it is a
+     * new transition. It did not reopen at all before 2026-09-06.
      */
     if ((usbsts & (XHCI_USBSTS_HCE | XHCI_USBSTS_HSE)) != 0) {
         if (!ext->ControllerFatal) {
@@ -1038,6 +1056,22 @@ static ULONG xhciCommandCompleted(PXHCI_EXTENSION ext,
                                   ULONG code,
                                   ULONG control)
 {
+    if (ext->CommandNoOpRewrittenPA != 0 &&
+        pointer == ext->CommandNoOpRewrittenPA) {
+        /*
+         * The No Op Command xhciCommandRingStopped wrote over an abandoned
+         * command (F12), answered by the xHC on the doorbell that followed.
+         * It is nobody's outstanding command, so it is retired from the ring
+         * and forgotten rather than counted as an event naming no TRB; the
+         * command that doorbell was rung for completes after it, on its own
+         * match below.
+         */
+        ext->CommandNoOpRewrittenPA = 0;
+        xhciRetireCommand(ext, pointer, code);
+        XHCI_DBG_VALUE_CHANGED("command: the rewritten No Op completed, TRB",
+                               pointer);
+        return 1;
+    }
     if (ext->CommandTrbPA == 0 || pointer != ext->CommandTrbPA) {
         /*
          * Expected input rather than an error in one case - an event arriving
@@ -1221,6 +1255,8 @@ static VOID xhciCommandAborted(PXHCI_EXTENSION ext, ULONG pointer)
  */
 static ULONG xhciCommandRingStopped(PXHCI_EXTENSION ext, ULONG pointer)
 {
+    ULONG abandoned;
+
     ext->CommandRingStops++;
 
     if (ext->CommandState != XHCI_CMD_STATE_ABORTING) {
@@ -1236,6 +1272,7 @@ static ULONG xhciCommandRingStopped(PXHCI_EXTENSION ext, ULONG pointer)
         return XHCI_CMD_ACTION_RESET;
     }
 
+    abandoned = ext->CommandTrbPA;
     if (ext->CommandTrbPA != 0) {
         /* The abort found the ring between commands, so the Command Aborted
          * event never came: "a Command Completion Event with the Completion Code
@@ -1258,6 +1295,64 @@ static ULONG xhciCommandRingStopped(PXHCI_EXTENSION ext, ULONG pointer)
     if (pointer == XhciRingTrbPA(&ext->CommandRing,
                                  ext->CommandRing.Trbs - 1)) {
         pointer = XhciRingTrbPA(&ext->CommandRing, 0);
+    }
+
+    /*
+     * **The reported position may still name the command just given up**, and
+     * the header's premise - that the xHC advanced past the aborted TRB - holds
+     * only for a command that was executing. A command doorbelled but never
+     * fetched (CRR still 1, the fetch wedged, `CA` written and the stop event
+     * arriving anyway) leaves the dequeue pointer ON that TRB, valid and
+     * unexecuted. Adopting the position as it stands would make the next
+     * doorbell execute the abandoned command ahead of the one it was rung for
+     * - a Disable Slot or Address Device the slot layer has already been told
+     * was lost - with a completion no outstanding command matches (the
+     * 2026-09-05 audit's F12). So the TRB is rewritten in place as a No Op
+     * Command, which is the command ring's own type 23 and not the transfer
+     * ring's type 8 that XhciRingNoOpAt writes, keeping its cycle bit so the
+     * xHC still fetches it and answers it harmlessly; its completion is
+     * recognised by `CommandNoOpRewrittenPA` in xhciCommandCompleted and
+     * retired there rather than counted unmatched. A rewrite the ring layer
+     * refuses falls through to the divergence reset below, since a position
+     * that cannot be edited cannot safely be adopted either.
+     */
+    if (abandoned != 0 && ext->CommandNoOpRewrittenPA != 0) {
+        /*
+         * A second abandonment while the first rewrite is still unanswered.
+         * If the xHC has still not fetched the No Op, the reported pointer is
+         * the No Op's address and the newly abandoned command sits behind it,
+         * valid and executable, which adopting the position would leave in
+         * place; if the xHC has passed the No Op, its completion is in flight
+         * with nothing left to recognise it once this marker is overwritten.
+         * Either way the ring's history is beyond what one marker tracks, and
+         * the honest answer is the divergence reset (the Phase 20 review's
+         * second finding).
+         */
+        ext->CommandRingDiverged++;
+        ext->CommandResetRequests++;
+        XHCI_DBG_VALUE_CHANGED("command: stopped again with a rewritten No Op "
+                               "still unanswered - requesting controller "
+                               "reset, TRB", pointer);
+        return XHCI_CMD_ACTION_RESET;
+    }
+    if (abandoned != 0 && pointer == abandoned) {
+        ULONG index;
+
+        if (XhciRingIndexFromPA(&ext->CommandRing, pointer, &index) !=
+                XHCI_RING_OK ||
+            XhciRingNoOpAtType(&ext->CommandRing, index,
+                               XHCI_TRB_TYPE_NOOP_COMMAND) != XHCI_RING_OK) {
+            ext->CommandRingDiverged++;
+            ext->CommandResetRequests++;
+            XHCI_DBG_VALUE_CHANGED("command: stopped on the abandoned command "
+                                   "and it could not be rewritten - requesting "
+                                   "controller reset, TRB", pointer);
+            return XHCI_CMD_ACTION_RESET;
+        }
+        ext->CommandRingStoppedOnAbandoned++;
+        ext->CommandNoOpRewrittenPA = pointer;
+        XHCI_DBG_VALUE_CHANGED("command: stopped on the abandoned command, "
+                               "rewritten as No Op Command, TRB", pointer);
     }
 
     if (XhciRingSetDequeue(&ext->CommandRing, pointer) != XHCI_RING_OK) {

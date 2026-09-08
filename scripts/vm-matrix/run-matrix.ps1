@@ -59,14 +59,31 @@ powershell -File scripts\vm-matrix\run-matrix.ps1 -Config scripts\vm-matrix\matr
 [CmdletBinding()]
 param(
     [string]$Config = "",
+    # The device matrix itself - the rows, their groups and their per-target
+    # expectations. Default: matrix.psd1 beside this script. Separate from
+    # -Config, which is the HOST's part (images, ports, where QEMU is): the
+    # matrix is committed and the config is not.
     [string]$Matrix = "",
+    # The qemu-system-x86_64 to launch, overriding the config's Qemu. Either
+    # the executable or the directory holding it; a relative path is taken
+    # against the repository root, as every path parameter here is. Giving one
+    # that is not there is an ERROR rather than the first guess of a search:
+    # naming a QEMU is naming which build the readings were taken with.
     [string]$Qemu = "",
     [string[]]$Target = @(),
     [string[]]$Group = @(),
+    # Where the report, the per-target reports, the debug-console logs, the
+    # QEMU stderr and any failure screenshots are written. Defaults to the
+    # config's OutDir, or for -PostRelease to a per-version directory under
+    # its PostReleaseOutDir.
     [string]$OutDir = "",
     [string]$ReportName = "device-matrix.txt",
     [switch]$ValidateOnly,
     [switch]$PostRelease,
+    # On a group-level failure, leave the guest RUNNING on its monitor instead
+    # of quitting it, so the machine can be looked at in the state that failed.
+    # It also means the image file stays open, which is why the run cannot
+    # snapshot or copy it afterwards.
     [switch]$KeepGuestOnFailure,
     # The root port every device under test is attached to. Windows 98 keys a
     # devnode by bus location, so this must match where a prep pass taught the
@@ -75,19 +92,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "lib\repo.ps1")
 . (Join-Path $PSScriptRoot "lib\monitor.ps1")
 . (Join-Path $PSScriptRoot "lib\qemu.ps1")
 . (Join-Path $PSScriptRoot "lib\counters.ps1")
 . (Join-Path $PSScriptRoot "lib\verdict.ps1")
 . (Join-Path $PSScriptRoot "lib\fresh.ps1")
 
-$repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-function Resolve-RepoPath {
-    param([string]$P)
-    if ([string]::IsNullOrWhiteSpace($P)) { return "" }
-    if ([IO.Path]::IsPathRooted($P)) { return $P }
-    return (Join-Path $repo $P)
-}
+$repo = Get-VmMatrixRepoRoot
 
 # ------------------------------------------------------------------- config ---
 if ($Config -eq "") {
@@ -150,6 +162,12 @@ foreach ($g in $mx.Groups) {
         $rowCount++
         if ($available -notcontains $r.Model) {
             $problems += ("row {0}: this QEMU build has no device model '{1}'" -f $r.Name, $r.Model)
+        }
+        # The attach leg sleeps on Settle; a row without the key threw there
+        # and ended its whole group, after boots had been spent (roadmap Phase 20,
+        # smaller items). Refused before a boot, like every other matrix error.
+        if (-not $r.ContainsKey('Settle') -or -not ($r.Settle -is [int]) -or [int]$r.Settle -lt 0) {
+            $problems += ("row {0}: has no non-negative integer Settle, which the attach leg sleeps on" -f $r.Name)
         }
         $problems += (Get-RowWedgeProblems -Row $r -TargetIds $targetIds)
         $problems += (Get-RowNoDriverProblems -Row $r -KnownKeys $targetIds)
@@ -270,7 +288,12 @@ function Add-RowBackends {
     # Measured with qom-get on QEMU 11: null -> false, file -> true, for both.
     if ($Row.ContainsKey('NeedsChardev')) {
         $chrPath = Join-Path $OutDir ("matrix-{0}-chr{1}.log" -f $tag, $Row.NeedsChardev)
-        $wanted += ("chardev-add file,id=matrixchr{0},path={1}" -f $Row.NeedsChardev, $chrPath)
+        # Composed and quoted by New-ChardevAddCommand (lib\monitor.ps1): an
+        # -OutDir with a space made every chardev row ERROR on every target
+        # (roadmap Phase 20, smaller items), and quoting the path value alone
+        # did not fix it - HMP quotes whole arguments only, so the whole
+        # option string is what is quoted, and a comma is refused.
+        $wanted += (New-ChardevAddCommand -Id ("matrixchr{0}" -f $Row.NeedsChardev) -Path $chrPath)
     }
     foreach ($cmd in $wanted) {
         if ($script:backendsAdded.ContainsKey($cmd)) { continue }
@@ -405,10 +428,13 @@ function Invoke-AttachLeg {
         [Parameter(Mandatory = $true)]$Table,
         $Process,
         [bool]$Pump = $true,
-        [int]$DutPort = 2
+        [int]$DutPort = 2,
+        [string]$DebugconLog = ""
     )
     $legError = ""
     $attached = $false
+    $before = $null
+    $after = $null
 
     # Wake the controller immediately before the attach.  Windows 98
     # idle-suspends about half a second after the last transfer and
@@ -421,6 +447,16 @@ function Invoke-AttachLeg {
     # row's measured window.
     Add-RowBackends -Port $Port -Row $Row
 
+    # THE IDENTITY IS RE-CHECKED BEFORE EVERY READ, not once per group: a
+    # Windows 2000 disable/enable mid-group reloads the image at a new VA, and
+    # a read against the old one decodes freed memory into plausible numbers
+    # (roadmap Phase 20, smaller items; soak-11v.ps1 already did this).
+    if ($DebugconLog -ne "") {
+        $drift = Get-ExtensionIdentityDrift -Ident $Ident -DebugconLog $DebugconLog
+        if ($drift -ne "") {
+            return [pscustomobject]@{ Error = $drift; Before = $null; After = $null; Attached = $false }
+        }
+    }
     $before = Read-Counters -Port $Port -BaseVa $Ident.Va -Table $Table -Process $Process
 
     # THE DEVICE UNDER TEST ALWAYS GOES ON THE SAME ROOT PORT.
@@ -598,7 +634,12 @@ function Invoke-AttachLeg {
             }
         } else {
             Start-Sleep -Seconds 3
-            $after = Read-Counters -Port $Port -BaseVa $Ident.Va -Table $Table -Process $Process
+            $drift = if ($DebugconLog -ne "") { Get-ExtensionIdentityDrift -Ident $Ident -DebugconLog $DebugconLog } else { "" }
+            if ($drift -ne "") {
+                $legError = $drift
+            } else {
+                $after = Read-Counters -Port $Port -BaseVa $Ident.Va -Table $Table -Process $Process
+            }
         }
     }
 
@@ -749,7 +790,16 @@ foreach ($tgt in $targetsToRun) {
             "-action", "reboot=reset", "-no-shutdown",
             "-monitor", ("tcp:127.0.0.1:{0},server=on,wait=off" -f $tgt.Monitor)
         )
-        if ($tgt.Accel -ne "") { $args += @("-accel", $tgt.Accel) }
+        # A MISSING `Accel` KEY IS NOT AN EMPTY ONE. `$tgt.Accel` on a hashtable
+        # without that key answers $null, `$null -ne ""` is true, and the
+        # launch then carried a bare `-accel` with the next argument as its
+        # value - a dangling switch that eats `-smp` or `-drive` and fails with
+        # a message about the wrong option. Every tracked config has the key,
+        # which is why it survived; a hand-written one need not (the 2026-09-07
+        # audit's H25).
+        if ($tgt.ContainsKey('Accel') -and $null -ne $tgt.Accel -and "$($tgt.Accel)" -ne "") {
+            $args += @("-accel", "$($tgt.Accel)")
+        }
         # A TARGET WITHOUT AN `Smp` KEY GETS NO -smp ARGUMENT AT ALL, which is
         # what a uniprocessor guest needs - so this is additive and 2a and 2b
         # launch byte-for-byte as before.  It exists because the 2d SMP guest is
@@ -783,6 +833,16 @@ foreach ($tgt in $targetsToRun) {
         $proc = Start-Qemu -Qemu $qemuBin -QemuArgs $args -StderrFile $stderrFile
         $groupError = ""
         $rowInFlight = ""
+        # EVERY ROW IS "BEHIND" UNTIL THE LOOP BELOW REACHES IT. The first cut
+        # of the H20 fix started this empty and filled it only inside the row
+        # loop, which left the failures that happen BEFORE the first row -
+        # the monitor never answering, the driver never starting, the offset
+        # table stale, the guest dead out of the boot - counting exactly one
+        # row and nothing not reached. Those are the commonest group-level
+        # failures there are, and they are the ones the audit's own example
+        # was: a failed HID boot must read as the group's whole row count, not
+        # as one.
+        $rowsBehind = @($grp.Rows)
         try {
             if (-not (Wait-Monitor -Port $tgt.Monitor -TimeoutSeconds 60)) {
                 $err = Get-QemuStderr -StderrFile $stderrFile
@@ -893,6 +953,16 @@ foreach ($tgt in $targetsToRun) {
                 # when everything stopped, and the row had to be inferred from
                 # the fact that the group holds exactly one.
                 $rowInFlight = $row.Name
+                # And WHICH ROWS ARE STILL BEHIND IT, for the tally in the
+                # catch below (the 2026-09-07 audit's H20). The rows a group
+                # never reached because it ended early have to be counted, or
+                # the target's own report understates what it did not measure -
+                # a failed HID boot on 2b read as twelve rows and none not
+                # reached, where the truth is seventeen and six. That is the
+                # same shape as the F11 defect `lib\fresh.ps1` documents, one
+                # level up: a target with rows it never got to must not look
+                # like a target that had none.
+                $rowsBehind = @($grp.Rows | Select-Object -Skip ($grp.Rows.IndexOf($row) + 1))
                 $key = "{0}|{1}" -f $row.Name, $tgt.Id
                 $expectations = $parsed[$key]
                 # A UNIQUE id per row, not a shared `dut`.  When the first row
@@ -946,7 +1016,8 @@ foreach ($tgt in $targetsToRun) {
                         Start-Sleep -Seconds 5
                     }
                     return (Invoke-AttachLeg -Port $tgt.Monitor -Row $row -Dut $dut -Ident $ident -Table $table `
-                                             -Process $proc -Pump ([bool]$grp.Pump) -DutPort $DutPort)
+                                             -Process $proc -Pump ([bool]$grp.Pump) -DutPort $DutPort `
+                                             -DebugconLog $dbgLog)
                 } -OnLegError {
                     param($Leg, $LegName, $LegResult)
                     $shot = Save-GuestScreenshot -Port $tgt.Monitor `
@@ -1080,9 +1151,31 @@ foreach ($tgt in $targetsToRun) {
             # outcome word stays ERROR either way, and the line is in the
             # report, so a run that does NOT reproduce the wedge changes the
             # diff.
-            $script:tgtTally.Rows++
             if ($PostRelease -and (Test-RowCountsAgainst -Outcome "ERROR" -WedgeDeclared $wedgeDeclared)) {
                 $script:tgtTally.Against++
+            }
+
+            # **The rows this group never measured**, which used to vanish
+            # (audit H20). `lib\fresh.ps1` says `Rows` includes rows "never
+            # reached because the group ended early" and that both add to
+            # `NotReached`; only the row in flight was ever added, so the count
+            # of what a run did not measure was short by the whole tail of
+            # every group that ended early - and by the WHOLE group when the
+            # failure came before the first row, which is where the monitor
+            # timeout, the driver that never started and the dead guest all
+            # land. Unreached rows are not EXCLUDED - nothing decided they
+            # should not run - so they get no report line of their own; what
+            # they get is the arithmetic.
+            $behind = 0
+            if ($null -ne $rowsBehind) { $behind = @($rowsBehind).Count }
+            $add = Get-GroupFailureTally -GroupRows (@($grp.Rows).Count) `
+                                         -Reached (@($grp.Rows).Count - $behind) `
+                                         -RowInFlight ($rowInFlight -ne "")
+            $script:tgtTally.Rows += $add.Rows
+            $script:tgtTally.NotReached += $add.NotReached
+            if ($add.NotReached -gt 0) {
+                $where = if ($rowInFlight -ne "") { "behind it in this group" } else { "in this group" }
+                Write-Host ("  and {0} row(s) {1} were never reached" -f $add.NotReached, $where)
             }
 
             $label = if ($rowInFlight -ne "") {
@@ -1181,7 +1274,7 @@ $header += ("# host   : {0}" -f $env:COMPUTERNAME)
 $header += ("# offsets: SIZEOF {0}, {1} counters" -f $table.Sizeof, $table.Offsets.Count)
 $header += ("# matrix : {0} rows" -f $rowCount)
 $header += "#"
-$header += "# Outcomes: PASS FAIL NODRIVER INERT ERROR - see docs/contributing/design/06-device-matrix-verdict.md"
+$header += "# Outcomes: PASS FAIL NODRIVER INERT ERROR, plus EXCLUDED for a row not run on a target - see docs/contributing/design/06-device-matrix-verdict.md"
 $header += "# A '-> X' in the outcome column marks the expectation that did not hold."
 $header += "#"
 $header += ("{0,-6} {1,-22} {2,-9} {3,-62} {4}" -f "TARGET", "ROW", "OUTCOME", "EXPECTATION", "READING")

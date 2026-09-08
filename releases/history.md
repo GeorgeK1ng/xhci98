@@ -12,6 +12,66 @@ every published directory carries the history up to and including itself.
 columns because it is read on the target machine, in Windows 98 Notepad or DOS
 EDIT, where a `.md` file renders as nothing and its markup is just noise.)
 
+## 1.0.2.0 - 2026-09-07
+
+A fix release. An audit found no critical defect and nineteen things worth
+fixing across the driver, the two tools and the package. All of them are
+closed (`docs/contributing/roadmap.md`, Phase 20).
+
+The install changes in one way: Windows now supplies `usbui.dll` as well,
+which brings back the USB Root Hub's Power tab on Windows 2000 and Windows
+XP. Everything else about it is as `1.0.1.0` left it.
+
+The device matrix on Windows 98 SE and Windows 2000 was re-read on this
+driver and is no worse than `1.0.1.0`'s. One change here has no machine
+behind it, the control-endpoint refusal below: nothing has been built to
+produce that state on purpose, and a test on the development machine is what
+covers it.
+
+### What changed
+
+- The driver: an endpoint handle the hub driver has already replaced can no
+  longer act on the endpoint that replaced it, and a device's endpoint table
+  is reset under the lock the endpoint callbacks take. Read on a two-CPU
+  Windows 2000 guest under Driver Verifier, the controller killed from
+  outside the guest four times and back each time with every device, and on
+  the Windows XP sequence `1.0.1.0`'s fix was for.
+- The driver: a device this driver has given up on can no longer have its
+  control endpoint opened, or reopened after the failure. Covered by a host
+  test; no machine has shown it.
+- The driver: after an in-place controller recovery the health poll's fatal
+  latch reopens, so a second fault is recovered too. Until now only the
+  first after boot was.
+- The driver: a recovery whose delivery is lost no longer stays armed for
+  ever. It ages out after twenty health polls, counts as one of the bounded
+  attempts, and a late delivery from the expired request is ignored.
+- The driver, three smaller ones: a Command Ring Stopped event still naming
+  the abandoned command is resolved with a No Op rather than by adopting
+  that command's own entry; the BIOS handoff write preserves the reserved
+  bits of `USBLEGCTLSTS`; and the restore from standby puts back the
+  interrupt moderation value it saved instead of zero. The last is
+  host-model only, since the virtual machines fail every restore.
+- The tools: `XHCISNAP` exits nonzero on a report it could not finish
+  writing instead of calling it written, and refuses a snapshot whose
+  extension size does not match the driver's. `XHCIQUAL`'s EHCI clean-up no
+  longer writes the controller's write-one-to-clear status bits back.
+- The install: Windows supplies `usbui.dll` too, from its own installation
+  source and only if the file is absent, by the same rule as `usbd.sys` and
+  `usbhub.sys`. On Windows 2000 and Windows XP that brings back the USB Root
+  Hub's Power tab, showing the hub's power budget and what is attached:
+  those systems' own installer asks for that page and names this file as its
+  provider, so on a machine that never had a USB controller it was silently
+  missing. On Windows 98 and Windows ME nothing you can see changes.
+  Upgrading a Windows 98 or Windows ME machine may ask for the Windows CD
+  where the last install did not, because this file is new here; it sits on
+  the same cabinet as the other two, so the same CD answers it. No Microsoft
+  file is in the download.
+- The download: `readme.txt` and `LICENSE` no longer describe Microsoft
+  files it stopped carrying in `1.0.0.1`, and the "Windows 2000 never idles
+  this controller" statement carries the measurement that qualified it
+  (`1.0.1.0`'s correction below). The checks that produce the download were
+  tightened; its layout is unchanged.
+
 ## 1.0.1.0 - 2026-09-04
 
 Windows XP joins the targets supported in virtual machines, the Windows 2000
@@ -23,15 +83,14 @@ in `1.0.0.1`.
 ### What changed
 
 - 32-bit Windows XP (SP3) is supported, in virtual machines only, the
-  standing Windows ME has. On 2026-09-03 an XP guest whose only USB
-  controller was the xHCI installed the package from its directory with no
-  prompt for media, loaded the driver on the first boot under XP's own USB
-  stack, and bound a HID mouse, a USB mass-storage device and a composite
-  audio device; disable, enable, remove and rescan in Device Manager all
-  survived. XP reads the INF's Windows 2000 half, shows its unsigned-driver
-  warning (choose Continue Anyway) and asks for nothing else. NUSB is a
-  Windows 98 SE package and is not for XP. Nothing has run on XP on real
-  hardware.
+  standing Windows ME has. An XP guest whose only USB controller was the
+  xHCI installed the package from its directory with no prompt for media,
+  loaded the driver on the first boot under XP's own USB stack, and bound a
+  HID mouse, a USB mass-storage device and a composite audio device;
+  disable, enable, remove and rescan in Device Manager all survived. XP
+  reads the INF's Windows 2000 half, shows its unsigned-driver warning
+  (choose Continue Anyway) and asks for nothing else. NUSB is a Windows 98
+  SE package and is not for XP. Nothing has run on XP on real hardware.
 - Windows 2000 and Windows XP: `usbport.sys`, the USB stack this driver
   plugs into, now comes from the operating system's own driver cache
   (`sp4.cab`, `sp3.cab`), the way `usbd.sys` already did, and `usbhub.sys`
@@ -59,6 +118,14 @@ in `1.0.0.1`.
   failed on its first attach on XP and worked when unplugged and plugged in
   again (`docs/issues/04-xp-restore-device-ep0-remove.md`). Windows 98 SE
   and Windows 2000 never provoke it and read unchanged on the same binary.
+- Correction: the `DisableSelectiveSuspend` entry above says Windows 2000's
+  USB stack never idles this controller and the value changes nothing there.
+  That was generalised from the Phase 3 spike's observation window and was
+  never measured; the owner's checks contradict it. Whether and when Windows
+  2000 idles the controller is unestablished until a reading is recorded
+  (roadmap Phase 20, F18). The value is written on every install path
+  regardless, and that is unchanged.
+
 ## 1.0.0.1 - 2026-09-02
 
 The driver is unchanged. This release changes how it is installed: the
@@ -83,36 +150,17 @@ driver depends on come from Windows itself.
   controller already has the files and is not asked. Windows 2000 asks for
   nothing.
 - Windows ME is a supported target, in virtual machines only and under
-  SweetLow's USB 2.0 stack only, the standing Windows 2000 has. On
-  2026-09-02 a Windows ME guest loaded and started the driver and bound a
-  HID mouse, a USB mass-storage device and a composite audio device. Its
-  stock USB stack has no `usbport.sys`, so on a stock Windows ME machine the
-  driver installs and shows Code 2 until SweetLow's stack is installed;
-  NUSB is a Windows 98 SE package and is not for Windows ME. The INF is
-  unchanged by this: Windows ME reads its Windows 98 half.
+  SweetLow's USB 2.0 stack only, the standing Windows 2000 has. A Windows ME
+  guest loaded and started the driver and bound a HID mouse, a USB
+  mass-storage device and a composite audio device. Its stock USB stack has
+  no `usbport.sys`, so on a stock Windows ME machine the driver installs and
+  shows Code 2 until SweetLow's stack is installed; NUSB is a Windows 98 SE
+  package and is not for Windows ME. The INF is unchanged by this: Windows
+  ME reads its Windows 98 half.
 - `xhci98.sys` is rebuilt only so that its version resource matches; no
   driver code changed between `1.0.0.0` and this release.
 
 ## 1.0.0.0 - 2026-08-30
-
-Re-cut on 2026-08-30 under the same number, before anything had been
-uploaded, so there is no earlier `1.0.0.0` in anyone's hands to tell this one
-apart from. Between the first cut on 2026-08-29 and this one a repository
-audit found and fixed a set of driver defects, none of which had been seen
-on a machine: the PCI Bus Master restore now runs before the controller is
-declared initialised on resume; an all-ones register read (a controller that
-has dropped off the bus) is refused in every phase of a register wait rather
-than only the first; a failed control-endpoint quiesce no longer survives a
-device's re-enumeration; transfer events with codes the driver never asks for
-are refused and counted instead of acted on; a Command Ring Stopped event
-whose pointer sits on the ring's Link TRB is mapped to the right entry; a
-lost Enable Slot on a device that has already gone is abandoned instead of
-released twice; the resume-from-U3 pass writes U0 only to ports it actually
-resumed. The DOS qualifier's legacy-handoff writes now preserve the
-controller's reserved bits, and `XHCISNAP` refuses a snapshot whose declared
-size does not fit. The installer's own comments and every guide were
-corrected where they had drifted from the code. The release date moved with
-the cut, as it always does.
 
 The first release. There is nothing before it to compare against: the builds
 this project cut while the work was going on were numbered `0.x`, none was

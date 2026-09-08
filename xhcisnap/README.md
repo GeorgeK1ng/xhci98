@@ -95,7 +95,9 @@ other process's memory.
 - `.PSC` is the raw PORTSC array. When the driver reports that the controller
   has no usable register mapping (`SNAP_S_NO_MMIO`), PORTSC was not read and
   the `.PSC` is published as a 0-byte file beside a complete `.BIN`; the
-  screen says so at the time.
+  screen says so at the time. A controller whose root hub reports no ports
+  (`PortCount` 0) yields the same 0-byte `.PSC` with no such line: the
+  driver had nothing to read, and the empty file is the reading.
 
 A capture that fails before publication leaves the previous set alone. Each raw
 region is written to `NAME.BIN.TMP` / `NAME.PSC.TMP` and the pair is renamed
@@ -111,6 +113,31 @@ The PORTSC decode is printed on screen whatever the level, because that is what
 the bench reads on the spot. The headline test is per port: a port reporting a
 device connected with `PP` clear is Finding Q read off the register, whatever
 the other ports say.
+
+The exit code says whether the `.TXT` is the report. There are four, not two.
+`1` is a route failure: `\\.\HCD0` would not open, or `-probe` ran and
+published no dump - nothing was attempted. `2` is a usage error: no arguments
+at all (which prints the short usage), a bad `-verbosity` value, or one of the
+refused flag combinations - `-verbosity` with `-disable`, which are opposites,
+or either of those with `-probe` or `-dump`, which read the driver rather than
+setting it. `0` means the file was
+created and every write and the close reached the volume. `3` means it was
+not created (the summary line reads `NOT CREATED`; the report went to the
+screen), or it was created but not completed (a full or removed destination;
+`INCOMPLETE`), or the extension window came back a different size from the
+one the driver declared (`MISMATCH`, `DO NOT DECODE`, printed whatever
+happened to the `.TXT`): in every case the `.BIN` and `.PSC` are still the
+raw evidence and are still named, but the `.TXT` must not be sent as the
+report. Until the
+2026-09-05 audit (roadmap Phase 20, F5, F17) `fopen` succeeding was the whole of
+"written", and a truncated report exited 0 with a "send this" underneath it.
+`xhcisnap -selftest-report BASE` drives the report path with no controller,
+and the `XHCISNAP_FAULT` environment variable (`write` or `close`) makes the
+named step fail; `xhcisnap\selftest.cmd` runs four cases - no fault, write
+fault, close fault, and a read-only destination.
+
+The help is `-help`, `-?` or `/?`; all three print the long text, and a bare
+invocation prints the short usage and exits 2 rather than taking a dump.
 
 ## Three things to know before trusting a dump
 
@@ -160,8 +187,11 @@ It works on Windows 98. Observed in the 2a QEMU guest, on NUSB 3.3's own
 return 0 / 2 / 4 / 7, the driver's own debug trace carries `cb PassThru` lines
 (so the callback was reached rather than inferred), and an 87,592-byte
 extension image came back in two windows and decoded against an `offsets.txt`
-regenerated from the same tree, with the header's tear detector equal to the
-`CheckCallbacks` decoded out of the dump body.
+regenerated from the same tree, with the header's tear detector agreeing across both windows and equal to the
+`CheckCallbacks` decoded out of the dump body. The tear detector has since
+become a sum of four counters rather than that single one, so the equality in
+that reading is a property of the version it was taken on; what the tool
+checks now, and reports, is only that every window's detector agreed.
 
 Only three of those four numbers are fixed. The first control reports whether
 this driver answered, so it is state-dependent by design: `0` when the channel
@@ -219,7 +249,12 @@ value is set from ring 3 without needing the IOCTL at all.
 
 ```bat
 xhcisnap\build.cmd
+xhcisnap\selftest.cmd
 ```
+
+The second runs the report path four times with no controller present (no
+fault, a failing write, a failing close, a `.TXT` that cannot be created) and
+checks the exit codes and summary lines; see "Three files" above.
 
 MSVC 6.0 in place from `tools\MSVC600`; nothing is installed machine-wide and
 `MSVC6` overrides the location. `/Za` is not used here even though the driver

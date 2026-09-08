@@ -9,14 +9,16 @@ each page.
 
 Dates are 2026 unless stated. Task ids are the roadmap's.
 
-Issues 1 to 3 were fixed before `1.0.0.0`, so none of them is a limitation
-of the release; those pages are here for the mechanism and for how it was
-found. Issue 4 was observed on the Windows XP guest on 2026-09-03 and
+Issues 1 to 3, 5 and 6 were fixed before `1.0.0.0`, so none of them is a
+limitation of the release; those pages are here for the mechanism and for
+how it was found (issue 5's fix is a registry value the release notes list
+as a known limitation because it is machine-wide). Issue 4 was observed on the Windows XP guest on 2026-09-03 and
 fixed the same day as roadmap task 19.7 in release `1.0.1.0`: a host vector
 reproduces the mechanism, and the closing run on a clean install (`i4b`)
-saw the restore recur on both devices and the fix carry them. What the
-task still owes is the reading on both primary targets that nothing changed
-there.
+saw the restore recur on both devices and the fix carry them. The reading on
+both primary targets that nothing changed there was taken the same night: the
+device matrix on the Windows 98 SE and Windows 2000 guests plus the Windows 98
+door sequence, with the counter at zero throughout. Nothing is owed.
 
 | # | Issue | Status |
 |---|---|---|
@@ -24,6 +26,8 @@ there.
 | 2 | [The bare-metal wedge, the PORTSC watchdog that "fixed" it, and what was actually wrong](02-bare-metal-wedge-and-portsc-watchdog.md) - five hot-plugs kill the controller on two Intel generations and never in QEMU; a polled sweep recovers it for the wrong reason; the cause is a recovery step nobody ever sends | Fixed |
 | 3 | [Composite devices need `usbhub.sys`, and an xHCI-only machine never has it](03-usbhub-sys-composite-devices.md) - Code 2 on every multi-function device, blamed on NUSB for two weeks, settled by one file and a laptop that was not in the plan | Fixed |
 | 4 | [A device Windows XP's hub re-creates mid-enumeration is failed by this driver](04-xp-restore-device-ep0-remove.md) - XP re-created a mass-storage device through a second device handle and removed the first one's EP0 last; the driver's REMOVE path unbinds whichever EP0 extension arrives, the live handle is refused for retry, and the progress detector fails the device. Replugging works | Fixed in `1.0.1.0` (task 19.7, closing run `i4b` 2026-09-03: the counter moved to 2 while both devices bound on their first attach; the same night the device matrix on both primary targets and the Windows 98 door sequence read unchanged on the same binary with the counter at 0) |
+| 5 | [A device plugged into an idle Windows 98 controller is seen by nothing, and why the package writes `DisableSelectiveSuspend`](05-idle-suspend-and-disableselectivesuspend.md) - usbport idle-suspends the controller half a second after the bus goes quiet, a halted xHC cannot raise a port event, EHCI's re-armed interrupt has no xHCI equivalent, and the fix is usbport's own registry switch, machine-wide and measured on both Windows 98 stacks (present = 1 stops the idle; absent or 0 does not) | Fixed (task 11-V.6 on the Windows 98 path; `1.0.1.0` on the NT path) |
+| 6 | [A Full-Speed device on a root port bugchecks both targets, and why every root port is reported as High Speed](06-full-speed-root-port-bugcheck.md) - usbport applies the EHCI model and looks up a transaction translator for any non-High-Speed root-port device; `USBPORT_GetTt` turns the root hub's empty TT list into a garbage pointer and the kernel faults on the first insertion, on both shipping builds; the one lever is the USB2 flag, so the driver reports every root port as High Speed and keeps the true speed for its own contexts, at the cost of 1/2/4 ms interrupt bands for Full and Low Speed devices on a root port | Fixed (Phase 5 task 7) |
 
 ## Other issues worth a page
 
@@ -32,18 +36,6 @@ These are recorded in [lessons.md](../contributing/lessons.md) and
 of the same shape. Listed roughly in order of how much they would teach a
 reader.
 
-- The Windows 98 idle hot-plug defect. A device plugged after the
-  controller idle-suspends is seen by nothing until a Device Manager Refresh.
-  Microsoft's own `usbehci.sys` was disassembled to learn that it re-arms Port
-  Change Detect after halting the controller, a trick that is a category error
-  on xHCI, where an interrupt exists only as an Event TRB and a halted
-  controller may not generate port events (spec Fig. 4-34 note). Timer polls
-  and PME# were then eliminated by measurement. The whole investigation had
-  answered "how does a driver wake a sleeping controller"; the owner asked
-  "can the sleep be prevented?", and `strings` on the same binary found two
-  registry values usbport reads (`HcDisableSelectiveSuspend` and the global
-  `DisableSelectiveSuspend`, which must both be set). Fixed by one `AddReg`
-  line, no driver code.
 - EP0's initial max packet size of 8 is babble on usbport. Two
   Sound Blasters read nothing (Code 22, no wizard). A field census of
   `bMaxPacketSize0` across the equipment showed the failing units shared only
@@ -51,12 +43,6 @@ reader.
   driver cannot change that, so a device answering in 16- or 64-byte packets
   on an endpoint declared as 8 dies on the first read. That is why Linux
   starts Full-Speed EP0 at 64. One constant changed.
-- A Full-Speed device on a root port bugchecks both targets. The
-  root hub was reporting correctly; the fault was in usbport's own handling of
-  a Full-Speed device that is a direct child of a 2.0 root hub, a situation no
-  EHCI miniport can produce, so Microsoft's binary had never been exercised on
-  it. Bugcheck forensics from raw parameters, a refuted hypothesis, and a fix
-  with a documented blast radius.
 - The multi-TRB short packet. A passed-through ASIX Ethernet
   adapter enumerated, bound, and never passed traffic: its 16 KB receive was a
   multi-TRB TD, the short packet landed on the first TRB, and QEMU's xHC
@@ -74,11 +60,16 @@ reader.
   never returns and hangs the boot inside `StartController`. The probe that
   established it was itself confounded once by asking for the wrong access
   mask. This is why the file sink in issue 1 died.
-- The published debug flavour does not load on real silicon (still open). One
-  import differs from the release build, `HAL.dll!WRITE_PORT_UCHAR`, the
-  port-`0xE9` writer, and the E460 gives it Code 2. Either the import does not
-  resolve or something on that chipset decodes `0xE9`. The three-flavour split
-  exists so the question can stay open.
+- Why a `0.0.0.4`-era debug binary did not load on real silicon (defect 2b,
+  still open). That binary carried one import the release build did not,
+  `HAL.dll!WRITE_PORT_UCHAR`, the port-`0xE9` writer, and the E460 gave it
+  Code 2. Either the import did not resolve or something on that chipset
+  decodes `0xE9`; the P6 binaries of `runs/run-13e.md` were built to separate
+  the two and the cause has never been read. What is NOT open is the shipped
+  article: the three-flavour split of task 13-L.1 moved every `XHCI_DBG_*`
+  site and the `0xE9` mirror into the never-published `qemu` flavour, so the
+  published `debug` flavour no longer carries the differing import at all.
+  The split exists so the question can stay open without shipping it.
 - The hub-churn wedge and the false green. 150 hub add/remove
   pairs were written up as clean on the strength of a screenshot and a single
   `info irq` sample; the guest was silently wedged (IDE IRQ frozen, clock

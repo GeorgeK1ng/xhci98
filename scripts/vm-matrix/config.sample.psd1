@@ -11,7 +11,12 @@
 @{
     # Blank means "find it": an explicit -Qemu argument, then $env:XHCI98_QEMU,
     # then PATH, then the install layouts this project has met (winget's
-    # C:\Program Files\qemu and a scoop prefix).  Set it here to pin one.
+    # C:\Program Files\qemu and a scoop prefix).  Set it here to pin one -
+    # either the executable or the directory holding it, absolute or relative
+    # to the repository.  A value that is not there is an error rather than the
+    # first guess of that search: pinning a QEMU is saying which build the
+    # readings were taken with, so falling back to another install would answer
+    # a different question under the same report.
     Qemu = ''
 
     VmDir = 'vm'
@@ -24,7 +29,8 @@
     # NOT `tools\w98se.img`: that is a 1.44 MB BOOT FLOPPY, whatever its name
     # suggests, and prepare-image.ps1 checks the size for exactly that reason.
     # The CABs live in \WIN98 on the CD.  This repo hardcodes no source; the
-    # image is proprietary and where you get it from is your business.
+    # image is proprietary and where you get it from is your business. Every
+    # ISO path in this file is an EXAMPLE to replace with your own.
     Win98Cd = 'D:\isos\w98se.iso'
 
     # $true (the default) boots every group with -snapshot, so the guest images
@@ -177,8 +183,26 @@
             Accel    = ''
             Monitor  = 55596
             BootSeconds = 240
+            # ReadySeconds (optional): how long the runner waits after the
+            # driver reports itself up before the first attach, when a target
+            # needs longer than the default to finish its own USB enumeration.
             Like     = '2a'
+            # EXAMPLE VALUES. The stamp is whatever prepare-image.ps1 -Stamp
+            # wrote onto YOUR clone (base-<version>-qemu for the version under
+            # test); this one is older than the newest run and is not a
+            # prediction of what your image carries.
             CloneFrom = @{ Image = 'fresh-2a.img'; Snapshot = 'base-1.0.0.0-qemu' }
+            # **PrepareOnly, and without it this template does not run.** The
+            # comment above already says "never a matrix target;
+            # prepare-image.ps1 only", and the flag is what makes that true -
+            # it was missing until the 2026-09-07 audit's H22. A target with a
+            # CloneFrom and no PrepareOnly is in the fresh pool, so
+            # `run-matrix.ps1 -PostRelease` validates it like any other and
+            # refuses the whole run over a sweetlow-2a.img that is missing or
+            # unstamped. Since this file is the template a fresh clone copies,
+            # that made the post-release run unrunnable out of the box on a
+            # host that had never built this guest.
+            PrepareOnly = $true
         }
         @{
             Id       = '2b-fresh'

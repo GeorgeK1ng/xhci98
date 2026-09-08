@@ -41,9 +41,16 @@ param(
     [string]$LocalScriptDir = "",
     [string]$Win2KIso = "D:\isos\win2ksp4.ISO",
     [string]$Win2KUsbdSys = "",
+    # Size of the qcow2 created by -CreateDisk, in qemu-img's own notation.
+    # Only read on creation: it cannot resize an image that already exists.
     [string]$DiskSize = "4G",
     [string]$QemuBinDir = "",
     [string]$XhciDevice = "qemu-xhci",
+    # The HMP monitor port the run launcher listens on. It must be UNIQUE
+    # across every launcher this repository generates, because the matrix
+    # addresses a guest by its port and two guests sharing one would answer
+    # for each other; scripts\test-qemu-launchers.ps1 asserts that no two
+    # generated launchers share a port.
     [int]$MonitorPort = 55556,
     [switch]$CreateDisk
 )
@@ -61,19 +68,8 @@ if ([string]::IsNullOrWhiteSpace($LocalScriptDir)) {
 Write-Step "Checking host"
 Test-SetupHost
 
-function Get-QemuTool {
-    param(
-        [string]$QemuBinDir,
-        [string]$ToolName
-    )
-    if (-not [string]::IsNullOrWhiteSpace($QemuBinDir)) {
-        $candidate = Join-Path $QemuBinDir $ToolName
-        if (Test-Path -LiteralPath $candidate) {
-            return $candidate
-        }
-    }
-    return (Find-Tool $ToolName)
-}
+# Get-QemuTool lives in common.ps1 - there were five copies of it and they
+# had drifted (the 2026-09-07 audit's H28).
 
 Write-Step "Checking QEMU"
 $qemuSystem = Get-QemuTool -QemuBinDir $QemuBinDir -ToolName "qemu-system-x86_64.exe"
@@ -81,11 +77,19 @@ $qemuImg = Get-QemuTool -QemuBinDir $QemuBinDir -ToolName "qemu-img.exe"
 
 if ($null -eq $qemuSystem) {
     Write-Warn "qemu-system-x86_64.exe is not on PATH. Install QEMU (see setup-qemu.ps1) or pass -QemuBinDir."
-    $qemuSystemCommand = "qemu-system-x86_64"
+    $qemuSystemCommand = ""
 } else {
     Write-Ok "Found $qemuSystem"
     $qemuSystemCommand = $qemuSystem
 }
+
+# QEMU is resolved at RUN time by each launcher, not baked in here: the host
+# that generated a launcher is not always the host that runs it
+# (scripts\local is git-ignored and OneDrive-synced), and
+# `setup-qemu.ps1 -Install` in particular writes launchers in a process whose
+# PATH predates the install it just performed. One resolver for all five
+# generators, in common.ps1 (the 2026-09-07 audit's H28 and H29).
+$qemuResolve = Get-QemuLauncherResolver -FoundPath $qemuSystemCommand
 
 if ($null -eq $qemuImg) {
     Write-Warn "qemu-img.exe is not on PATH. Disk image creation will be skipped unless QEMU is installed."
@@ -98,6 +102,50 @@ Ensure-Directory $VmDir
 Ensure-Directory $LocalScriptDir
 $xferDir = Join-Path $VmDir "xfer"
 Ensure-Directory $xferDir
+#
+# **A floppy controller on the run launcher**, empty at boot. build-and-test.md
+# has said since batch 13-L that "the launcher now carries `-drive if=floppy`",
+# and no generator wrote one - the fix was made by hand in the git-ignored
+# `scripts\local\` copy and was lost the next time this script ran, which is
+# the trap that doc paragraph goes on to name. The 2026-09-07 audit's H27.
+#
+# What it buys: `change floppy0 <path>` on the monitor inserts a disk into a
+# running guest at once, so `copy C:\SNAP.TXT A:` gets a file out of Windows
+# 2000 without a reboot and without the VVFAT disk, which is read-only. A
+# controller cannot be added live, so it has to be here at boot even though it
+# is empty; an empty floppy drive costs a Windows 2000 guest nothing.
+#
+# **EMPTY, not `file=vm\transfer.img`.** The first cut of this fix mounted the
+# shared courier image, which setup-qemu.ps1's Windows 98 run launcher already
+# mounts WRITABLE under the same path - so booting 2a and 2b together handed
+# one raw image to two guests to write, and a floppy image is a FAT volume
+# with no arbitration whatsoever. Empty is also what the workflow wants: the
+# whole point of `change floppy0` is choosing the disk at the moment the file
+# is ready, on a guest that is already up. Verified on QEMU 11: `-drive
+# if=floppy` with no `file=` starts, `info block` shows `floppy0: [not
+# inserted]`, and `change floppy0 <path>` inserts into it.
+$transferImage = Join-Path $VmDir "transfer.img"
+# Shared with setup-qemu.ps1's guests, which is deliberate: it is a courier,
+# and one blank 1.44 MB image serves every target. Created here too so this
+# script stands alone on a host where only the Windows 2000 guest exists.
+#
+# No launcher this script writes MOUNTS it - see the note above - so nothing
+# here creates the two-writer hazard on its own. The sharing is not thereby
+# harmless: setup-qemu.ps1's Windows 98 run launcher DOES mount it at boot, so
+# inserting it into this guest with `change floppy0` while that one is up is
+# still two writers on one FAT image. That is a per-use precondition rather
+# than a launcher defect, so it is stated where the operator is told to do it -
+# the next-steps text below - and not silently relied on.
+if (-not (Test-Path -LiteralPath $transferImage)) {
+    $stream = [System.IO.File]::Open($transferImage, [System.IO.FileMode]::CreateNew)
+    try {
+        $stream.SetLength(1474560)
+    } finally {
+        $stream.Close()
+    }
+    Write-Ok "Created blank 1.44 MB transfer floppy image: $transferImage"
+    Write-Warn "It is blank; format it inside a guest before first use."
+}
 $diskImage = Join-Path $VmDir "win2k.img"
 $debugConLog = Join-Path $VmDir "win2k-debugcon.log"
 $debugConPreviousLog = Join-Path $VmDir "win2k-debugcon.previous.log"
@@ -110,34 +158,10 @@ if (-not (Test-Path -LiteralPath $Win2KIso)) {
 } else {
     Write-Ok "Win2000 ISO: $Win2KIso"
 }
-function Assert-Win2KUsbdFile {
-    param([string]$Path)
-    $file = Get-Item -LiteralPath $Path
-    $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($file.FullName).FileVersion
-    if ($file.Length -ne 20688 -or $version -ne "5.00.2195.6658") {
-        throw "Expected Win2000 SP4 USBD.SYS 5.00.2195.6658 (20688 bytes); found version '$version' ($($file.Length) bytes) at: $Path"
-    }
-}
-
+# Both Win2000 generators stage this file the same way and pin it to the same
+# length and version; common.ps1 holds the one copy (audit J6).
 $stagedUsbd = Join-Path $xferDir "USBD.SYS"
-$defaultUsbd = Join-Path (Get-DefaultToolsDir) "win2ksp4-extracted\USBD.SYS"
-if ([string]::IsNullOrWhiteSpace($Win2KUsbdSys) -and
-    (Test-Path -LiteralPath $defaultUsbd)) {
-    $Win2KUsbdSys = $defaultUsbd
-}
-if (-not [string]::IsNullOrWhiteSpace($Win2KUsbdSys)) {
-    if (-not (Test-Path -LiteralPath $Win2KUsbdSys)) {
-        throw "Win2000 USBD.SYS not found at: $Win2KUsbdSys"
-    }
-    Assert-Win2KUsbdFile -Path $Win2KUsbdSys
-    Copy-Item -LiteralPath $Win2KUsbdSys -Destination $stagedUsbd -Force
-    Write-Ok "Staged Win2000 USBD.SYS for the preparation boot: $stagedUsbd"
-} elseif (Test-Path -LiteralPath $stagedUsbd) {
-    Assert-Win2KUsbdFile -Path $stagedUsbd
-    Write-Ok "Using already-staged Win2000 USBD.SYS: $stagedUsbd"
-} else {
-    Write-Warn "Win2000 USBD.SYS is not staged. Extract I386\USBD.SY_ from the SP4 ISO, expand it, then rerun with -Win2KUsbdSys <path> before attaching EHCI."
-}
+Install-Win2KUsbdSys -XferDir $xferDir -Win2KUsbdSys $Win2KUsbdSys | Out-Null
 
 if ($CreateDisk) {
     Write-Step "Creating QEMU disk image"
@@ -157,8 +181,9 @@ Write-Step "Writing QEMU launchers"
 Write-Ok "Using xHCI device model: $XhciDevice"
 
 $installCmd = Join-Path $LocalScriptDir "qemu-win2k-install.cmd"
-Write-AsciiFile $installCmd @(
-    "@echo off",
+Write-AsciiFile $installCmd (@(
+    "@echo off"
+) + $qemuResolve + @(
     "rem Phase 2b: Windows 2000 SP4 differential VM install launcher.",
     "rem The ISO is Win2000 Pro with SP4 integrated (retail FPP - Setup prompts",
     "rem for a product key).",
@@ -178,7 +203,7 @@ Write-AsciiFile $installCmd @(
     "  echo Missing ISO: %WIN2K_ISO%",
     "  exit /b 1",
     ")",
-    """$qemuSystemCommand"" ^",
+    """%QEMU%"" ^",
     "  -name ""xhci98 Windows 2000 SP4 differential"" ^",
     "  -machine pc,acpi=off ^",
     "  -global ide-device.win2k-install-hack=on ^",
@@ -192,11 +217,12 @@ Write-AsciiFile $installCmd @(
     "  -net none ^",
     "  -action reboot=reset -no-shutdown ^",
     "  -monitor tcp:127.0.0.1:$MonitorPort,server=on,wait=off"
-)
+))
 
 $runCmd = Join-Path $LocalScriptDir "qemu-win2k-run.cmd"
-Write-AsciiFile $runCmd @(
-    "@echo off",
+Write-AsciiFile $runCmd (@(
+    "@echo off"
+) + $qemuResolve + @(
     "rem Phase 2b: boot the installed Windows 2000 SP4 differential VM from HDD.",
     "rem Keep the SAME Standard-PC HAL flags as install (-cpu ...,-apic + acpi=off)",
     "rem or the installed system hits the same APIC-clock storm on normal boot.",
@@ -237,13 +263,14 @@ Write-AsciiFile $runCmd @(
     "    )",
     "  )",
     ")",
-    """$qemuSystemCommand"" ^",
+    """%QEMU%"" ^",
     "  -name ""xhci98 Windows 2000 SP4 differential"" ^",
     "  -machine pc,acpi=off ^",
     "  -cpu pentium3,-apic ^",
     "  -m 256 ^",
     "  -vga cirrus ^",
     "  -drive file=""$diskImage"",format=qcow2,if=ide ^",
+    "  -drive if=floppy ^",
     "  -drive ""file=fat:$xferDir,format=raw,if=ide,snapshot=on"" ^",
     "  -device usb-ehci,id=ehci ^",
     "  -device $XhciDevice,id=xhci ^",
@@ -254,10 +281,11 @@ Write-AsciiFile $runCmd @(
     "  -net none ^",
     "  -action reboot=reset -no-shutdown ^",
     "  -monitor tcp:127.0.0.1:$MonitorPort,server=on,wait=off"
-)
+))
 $prepareCmd = Join-Path $LocalScriptDir "qemu-win2k-prepare-usbd.cmd"
-Write-AsciiFile $prepareCmd @(
-    "@echo off",
+Write-AsciiFile $prepareCmd (@(
+    "@echo off"
+) + $qemuResolve + @(
     "rem SAFE PREPARATION BOOT: no USB controller is attached, so the incomplete",
     "rem Win2000 USB 2.0 stack cannot start. Before shutting down the guest, copy:",
     "rem   D:\USBD.SYS C:\WINNT\system32\drivers\USBD.SYS",
@@ -268,7 +296,7 @@ Write-AsciiFile $prepareCmd @(
     "  echo Rerun setup-qemu-win2k.ps1 with -Win2KUsbdSys ^<path-to-SP4-USBD.SYS^>.",
     "  exit /b 1",
     ")",
-    """$qemuSystemCommand"" ^",
+    """%QEMU%"" ^",
     "  -name ""xhci98 Windows 2000 SP4 USBD preparation"" ^",
     "  -machine pc,acpi=off ^",
     "  -cpu pentium3,-apic ^",
@@ -281,7 +309,7 @@ Write-AsciiFile $prepareCmd @(
     "  -net none ^",
     "  -action reboot=reset -no-shutdown ^",
     "  -monitor tcp:127.0.0.1:$MonitorPort,server=on,wait=off"
-)
+))
 
 Write-Ok "Wrote $installCmd"
 Write-Ok "Wrote $prepareCmd"
@@ -292,3 +320,7 @@ Write-Host "  1. Run scripts\local\qemu-win2k-install.cmd and install Windows 20
 Write-Host "  2. Ensure SP4 USBD.SYS is staged (use -Win2KUsbdSys if needed), then boot qemu-win2k-prepare-usbd.cmd and copy it into C:\WINNT\system32\drivers."
 Write-Host "  3. Shut down, then boot qemu-win2k-run.cmd (adds EHCI + xHCI)."
 Write-Host "  4. Do NOT install NUSB - the usbport stack is native to Win2000 SP4."
+Write-Host "  5. To get a file OUT of the running guest: on its monitor, 'change floppy0 $transferImage',"
+Write-Host "     then 'copy C:\SNAP.TXT A:' in the guest, then 'eject floppy0' when the copy is done."
+Write-Host "     transfer.img is SHARED with the Windows 98 guest, whose run launcher mounts it at boot,"
+Write-Host "     so insert it here only while that guest is down - two writers on one FAT image corrupt it."

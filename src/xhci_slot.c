@@ -310,6 +310,7 @@ static VOID xhciDevFoldQueue(PXHCI_EXTENSION ext, PXHCI_TRANSFER_QUEUE queue)
      * exactly the way those are - as ext-level totals that survive an unplug.
      */
     ext->ForeignEventsTotal += queue->ForeignEvents;
+    ext->TransferEventsReservedBitsSet += queue->ReservedBitsSet;
     ext->EventDataEventsTotal += queue->EventDataEvents;
     ext->BadCodesTotal += queue->BadCodes;
     ext->QueueErrorsTotal += queue->Errors;
@@ -433,6 +434,83 @@ static PXHCI_ENDPOINT_RECORD xhciEpByDci(PXHCI_DEVICE dev, ULONG dci)
         }
     }
     return NULL;
+}
+
+/*
+ * Has `endpoint` been superseded - is the record at `dci` bound to a
+ * *different* extension right now?
+ *
+ * Every endpoint callback names a record through the saved device index and
+ * DCI, and both of those outlive the binding: usbport can open the same
+ * endpoint through a second extension while the first is still open (issue 4's
+ * two-handle restore, for EP0), and a released device record is reused for
+ * the next device, so a stale handle resolves to a live record that belongs to
+ * someone else. The 2026-09-05 audit (F1) drove three such sequences through
+ * the real callbacks: a REMOVE through the old handle unbound the replacement,
+ * a PAUSED through it paused the replacement's EP0, and a submit through a
+ * closed old handle queued work on the live device. The pointer comparison is
+ * the whole identity test - there is no generation to check, because usbport
+ * cannot hand the same extension memory to a new endpoint without opening it
+ * here first, at which point it *is* the bound handle.
+ *
+ * **Unbound is not superseded.** A record whose pointer is NULL has had its
+ * REMOVE and is waiting for the reopen that rebinds it (batch 6-0: the two are
+ * indistinguishable at the REMOVE), and the calls that arrive in that window -
+ * a reset-pipe after a stop this driver could not issue is the pinned one -
+ * belong to the handle that is about to come back. Those keep the answers they
+ * always had; only a handle a *replacement* has displaced is declined.
+ *
+ * What a superseded handle may still do is withdraw its own work:
+ * `AbortTransfer` matches the transfer, not the handle, and is deliberately
+ * not gated on this. Called with the lock held. IRQL: any.
+ */
+static ULONG xhciEpHandleSuperseded(PXHCI_DEVICE dev,
+                                    ULONG dci,
+                                    PXHCI_ENDPOINT endpoint)
+{
+    PXHCI_ENDPOINT_RECORD record;
+    PVOID bound;
+
+    if (dev == NULL || endpoint == NULL) {
+        return 0;
+    }
+    if (dci <= 1) {
+        bound = dev->EndpointExtension;
+    } else {
+        record = xhciEpByDci(dev, dci);
+        if (record == NULL) {
+            return 0;
+        }
+        bound = record->EndpointExtension;
+    }
+    return (bound != NULL && bound != (PVOID)endpoint) ? 1UL : 0UL;
+}
+
+/*
+ * Does this handle still own a transfer on the queue? A same-parameter reopen
+ * rebinds the record to the new extension without draining what the old one
+ * queued, and usbport cancels that work through the old handle: PAUSED first,
+ * then AbortTransfer. The PAUSED is what starts the Stop Endpoint early enough
+ * to shrink the window in which the xHC can still execute a TD whose buffer
+ * usbport is about to unmap, so a superseded handle that demonstrably owns
+ * queued work keeps that one right (the Phase 20 review's third finding);
+ * every other superseded call is declined. Each transfer records the extension
+ * it arrived through. Called with the lock held. IRQL: any.
+ */
+static ULONG xhciEpHandleOwnsWork(const XHCI_TRANSFER_QUEUE *queue,
+                                  PXHCI_ENDPOINT endpoint)
+{
+    PXHCI_TRANSFER walk;
+
+    if (queue == NULL || endpoint == NULL) {
+        return 0;
+    }
+    for (walk = queue->Head; walk != NULL; walk = walk->Next) {
+        if (walk->EndpointExtension == (PVOID)endpoint) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static PXHCI_ENDPOINT_RECORD xhciEpFree(PXHCI_DEVICE dev)
@@ -1946,20 +2024,23 @@ static ULONG xhciDevBuildMarkHubInput(PXHCI_EXTENSION ext, PXHCI_DEVICE dev)
 /* ------------------------------------------------------------------ */
 
 /*
- * Take every transfer this device still owns off its queue, and the intercepted
- * SET_ADDRESS with them, and put them on the completion list.
+ * One endpoint's queue, detached and put on the completion list. Split out
+ * because a REMOVE names one endpoint and a teardown names them all
+ * (xhciDevCancelWork, below, which also withdraws the intercepted SET_ADDRESS),
+ * and the two must not be able to disagree about what cancelling a queue does.
  *
- * The ring is deliberately **not** repositioned. Reclaiming TRBs the xHC may
- * still be executing needs Stop Endpoint and Set TR Dequeue Pointer, neither of
- * which can be issued from a context that may not wait, and both of which are
- * task 7a-B.1's. On a teardown that costs nothing, because the whole slot is
- * about to be disabled; the note matters for the REMOVE path, which is where the
- * ring survives the drain.
+ * This detaches transfers; it does not touch the ring. Reclaiming the TRBs the
+ * xHC may still be executing is the quiescence machinery's job - the Stop
+ * Endpoint and Set TR Dequeue Pointer that `xhciEpOweReposition` and
+ * `xhciEpArmIfBusy` arm and the deferred pass issues asynchronously (batch
+ * 7a-B) - and the callers that need it arm it beside this call. On a teardown
+ * the whole slot is about to be disabled, so nothing is owed here; on the
+ * REMOVE path the ring survives the drain and the reposition is what makes the
+ * next doorbell safe. (An earlier header said those commands "cannot be issued
+ * from a context that may not wait" and were future work; they are issued, and
+ * asynchronously, which is how a context that may not wait issues them.)
+ * Called with the lock held. IRQL: <= DISPATCH_LEVEL.
  */
-/* One endpoint's queue, detached and put on the completion list. Split out
- * because a REMOVE names one endpoint and a teardown names them all, and the two
- * must not be able to disagree about what cancelling a queue does.
- * Called with the lock held. IRQL: <= DISPATCH_LEVEL. */
 static VOID xhciDevCancelQueue(PXHCI_EXTENSION ext,
                                PXHCI_TRANSFER_QUEUE queue,
                                LONG usbdStatus)
@@ -3452,24 +3533,18 @@ static VOID xhciDevTopoDetach(PXHCI_EXTENSION ext, PXHCI_DEVICE dev)
  *              `DevicesAbandoned`. That is what `XhciSlotInvalidateAll` already
  *              does when it cannot prove the controller let go.
  *
- * An earlier draft released the record here and marked the *rings* with a
- * sentinel owner instead, so that they were withheld from the free list while
- * the record's index was reused. That protected the ring and handed the
- * transfers' mapped pages back in the same breath, which is the larger half of
- * the same hazard - so the sentinel is gone and the whole record is withheld.
+ * (An earlier draft released the record and withheld only its *rings* through a
+ * sentinel owner; that handed the transfers' mapped pages back while the xHC
+ * could still write them, so the whole record is withheld instead.)
  *
- * **This is not a complete answer and must not be read as one.** usbport
- * reclaims a deleted device's transfers on its own, so withholding a completion
- * here cannot keep a mapping alive indefinitely; what closes the hazard is Stop
- * Endpoint, which is task 7a-B.1's. See the batch 7a-B note in
- * `docs/contributing/roadmap.md` for the four hazards that batch owns.
+ * Withholding a completion cannot keep a mapping alive indefinitely, because
+ * usbport reclaims a deleted device's transfers on its own; what closes the
+ * hazard is the Stop Endpoint the teardown chain issues before the Disable
+ * Slot (batch 7a-B), and this branch is the fallback for a chain that could
+ * not prove the stop.
  *
- * Called with the lock held.
+ * Called with the lock held. IRQL: <= DISPATCH_LEVEL.
  */
-/* Give a record up, and `slotReleased` is the whole contract: 1 means the
- * controller has been *shown* to have let the slot go, 0 means it has not and
- * the record is abandoned in place instead. See the two branches.
- * Called with the lock held. IRQL: <= DISPATCH_LEVEL. */
 static VOID xhciDevRelease(PXHCI_EXTENSION ext,
                            PXHCI_DEVICE dev,
                            ULONG slotReleased)
@@ -3853,6 +3928,26 @@ VOID XhciSlotInit(PXHCI_EXTENSION ext)
      *
      * Under the lock, because the completion list is the DPC's too. On an
      * ordinary start there is nothing here: usbport zeroed the extension.
+     *
+     * **The table reset that follows is under the same hold**, and that is the
+     * 2026-09-05 audit's F8. The init sequence is described as lockless on the
+     * precondition that every other context tests `INITIALIZED` before touching
+     * controller state - and the slot callbacks do not: `SubmitTransfer`,
+     * `SetEndpointState`, `AbortTransfer` and `XhciSlotDeferredWork` read and
+     * write `Devices[]` under the controller lock with no admission gate, and
+     * `xhciDevAdmitted` is consulted only after the record has been read. The
+     * in-place recovery runs this from a DPC with the controller still live
+     * from usbport's point of view, so on SMP another CPU inside a callback
+     * could read a half-zeroed record, or write into one already zeroed (an
+     * `xhciEpArmQuiesce` setting FAILED|UNAVAILABLE on `Ep0Quiesce.Flags`),
+     * leaving a FREE record with non-zero quiesce state that `xhciDevAllocate`
+     * hands to the next device as if it were clean. Holding the lock across
+     * the cancel, the zeroing and the field resets makes the reset one
+     * transition the callbacks see either wholly before or wholly after; a
+     * callback that got in first has its queued work cancelled here and
+     * delivered by the drain the caller runs afterwards, and one that comes
+     * after finds FREE records and answers as it does for any released device.
+     * Nothing under the hold waits or calls a usbport service.
      */
     {
         KIRQL oldIrql;
@@ -3869,48 +3964,64 @@ VOID XhciSlotInit(PXHCI_EXTENSION ext)
                 xhciDevFoldQueues(ext, &ext->Devices[i]);
             }
         }
+
+        for (i = 0; i < XHCI_MAX_SLOTS * (sizeof(XHCI_DEVICE) / sizeof(ULONG));
+             i++) {
+            ((ULONG *)ext->Devices)[i] = 0;
+        }
+        ext->CommandOwner = 0;
+        ext->CommandOwnerOp = XHCI_DEV_OP_NONE;
+        ext->PumpCursor = 0;
+        /*
+         * The completion list is **not** cleared: it may hold transfers the
+         * loop above has just detached, and dropping the head here would lose
+         * the answer usbport is waiting for rather than tidy anything. Its own
+         * drain empties it, and the caller reaches that drain after this
+         * returns.
+         */
+        /* The invalidation debts went with the device table the loop above
+         * cleared - they live on the records themselves now - so what is left
+         * here is the running total that counts them. */
+        ext->EndpointInvalidatesOwed = 0;
+        /*
+         * **`DeferredBusy` is deliberately not touched** (F8's second half).
+         * It is the single-drainer guard, and its owner is whichever call of
+         * `XhciSlotDeferredWork` set it - a call that drops the controller
+         * lock around every usbport service and re-takes it afterwards, so on
+         * SMP an active drainer can be inside its unlocked interval while this
+         * runs. Clearing the flag here, under the lock or not, would admit a
+         * second drainer beside it, and the first would clear the flag again
+         * on its way out under the second. On an ordinary start usbport has
+         * zeroed the extension and the flag is already 0; on a reinitialisation
+         * a set flag names a drainer that is still running and will clear it
+         * itself. There is no third state for this function to repair.
+         */
+        /*
+         * Task 7b-A.1: the device table this function just cleared is what
+         * every topology node's position was derived from, so the graph goes
+         * with it. On an ordinary start usbport has already zeroed the
+         * extension and this is a no-op; what it covers is a reinitialisation,
+         * where the tree would otherwise describe devices whose records have
+         * just been destroyed.
+         */
+        XhciTopoReset(&ext->Topology);
+        ext->EnumHubPort = 0;
+        /*
+         * Unspent, not spent: dropping the hint is exactly the "a reset
+         * completion was missed" case the fallback scan exists for, so leaving
+         * the claim spent here would disable the recovery this function is
+         * part of.
+         */
+        ext->EnumClaimSpent = 0;
+        ext->EnumResetSuppressed = 0;
+        /*
+         * EnumSequence deliberately survives, because it is not device state:
+         * it counts port resets for the life of the extension, and a test
+         * that watched it reset would be watching this function rather than
+         * the port.
+         */
         XhciControllerLockRelease(oldIrql);
     }
-
-    for (i = 0; i < XHCI_MAX_SLOTS * (sizeof(XHCI_DEVICE) / sizeof(ULONG));
-         i++) {
-        ((ULONG *)ext->Devices)[i] = 0;
-    }
-    ext->CommandOwner = 0;
-    ext->CommandOwnerOp = XHCI_DEV_OP_NONE;
-    ext->PumpCursor = 0;
-    /*
-     * The completion list is **not** cleared: it may hold transfers the loop
-     * above has just detached, and dropping the head here would lose the answer
-     * usbport is waiting for rather than tidy anything. Its own drain empties
-     * it, and the caller reaches that drain after this returns.
-     */
-    /* The invalidation debts went with the device table the loop above cleared -
-     * they live on the records themselves now - so what is left here is the
-     * running total that counts them. */
-    ext->EndpointInvalidatesOwed = 0;
-    ext->DeferredBusy = 0;
-    /*
-     * Task 7b-A.1: the device table this function just cleared is what every
-     * topology node's position was derived from, so the graph goes with it. On
-     * an ordinary start usbport has already zeroed the extension and this is a
-     * no-op; what it covers is a reinitialisation, where the tree would
-     * otherwise describe devices whose records have just been destroyed.
-     */
-    XhciTopoReset(&ext->Topology);
-    ext->EnumHubPort = 0;
-    /*
-     * Unspent, not spent: dropping the hint is exactly the "a reset completion
-     * was missed" case the fallback scan exists for, so leaving the claim spent
-     * here would disable the recovery this function is part of.
-     */
-    ext->EnumClaimSpent = 0;
-    ext->EnumResetSuppressed = 0;
-    /*
-     * EnumSequence deliberately survives, because it is not device state: it
-     * counts port resets for the life of the extension, and a test that watched
-     * it reset would be watching this function rather than the port.
-     */
 }
 
 /* IRQL: <= DISPATCH_LEVEL, controller lock held. */
@@ -3959,8 +4070,11 @@ VOID XhciSlotInvalidateAll(PXHCI_EXTENSION ext, ULONG controllerStopped)
              * failed - the caller's XhciFailClosedDma is the answer, and it
              * bugchecks rather than completing anything.
              *
-             * `EndpointExtension` is kept for the same reason: it is what a
-             * later completion is answered through.
+             * `EndpointExtension` is kept for the same reason: the binding
+             * has to survive the abandonment so a later REMOVE or reopen
+             * through that handle resolves to this record. (Completions
+             * themselves are answered through each XHCI_TRANSFER's own
+             * `EndpointExtension`, recorded at submit, not through this one.)
              */
             dev->State = XHCI_DEV_STATE_GONE;
             ext->DevicesAbandoned++;
@@ -4497,7 +4611,7 @@ static VOID xhciDevOweFromSlotState(PXHCI_EXTENSION ext, PXHCI_DEVICE dev)
  * Records left saying `CONFIGURED` make the later same-parameter reopen take the
  * rebind-only path, no Configure Endpoint is ever re-issued, and this driver
  * rings doorbells for DCIs the Slot Context no longer has. Putting them back to
- * `PENDING` is the established mechanism (`xhciEpContextRestore`): the pump
+ * `PENDING` is the established mechanism (`xhciEpOweContextRestore`): the pump
  * issues the Configure Endpoint from that state and submissions meanwhile are
  * refused for a retry rather than failed.
  *
@@ -4974,15 +5088,14 @@ static MPSTATUS xhciSlotOpenControl(
          * address and written by the SET_ADDRESS interception.
          */
         dev = xhciDevByAddress(ext, properties->DeviceAddress);
-        if (dev == NULL) {
+        if (!xhciDevMayOpenEndpoint(dev)) {
             /*
-             * An addressed device this driver has no record of. It is not a
-             * device it can serve: the slot, the device context and the ring the
-             * xHC would need are all things only the addressing chain creates.
+             * Failed records retain ADDRESS_VALID for teardown. That lookup
+             * must not let a reopen bind EP0 or restart the command chain.
              */
             ext->OpenRefusals++;
-            XHCI_DBG_VALUE_CHANGED("slot: EP0 open for an address no record "
-                                   "holds", properties->DeviceAddress);
+            XHCI_DBG_VALUE_CHANGED("slot: EP0 open for an address no live "
+                                   "record holds", properties->DeviceAddress);
             XhciControllerLockRelease(oldIrql);
             return MP_STATUS_NO_RESOURCES;
         }
@@ -5624,7 +5737,24 @@ VOID XhciSlotSetEndpointState(PXHCI_EXTENSION ext,
         XhciControllerLockAcquire(&oldIrql);
         dev = xhciDevFromRef(ext, endpoint->DeviceIndex);
         if (dev != NULL && dev->State != XHCI_DEV_STATE_FREE &&
-            xhciEpResolve(dev, endpoint->Dci, &binding)) {
+            xhciEpHandleSuperseded(dev, endpoint->Dci, endpoint) &&
+            !(state == USBPORT_ENDPOINT_PAUSED &&
+              xhciEpResolve(dev, endpoint->Dci, &binding) &&
+              xhciEpHandleOwnsWork(binding.Queue, endpoint))) {
+            /*
+             * A handle a replacement has displaced (F1). PAUSED through it
+             * would stop the *replacement's* endpoint and ACTIVE would restart
+             * it on the old handle's say-so; the transfers this handle still
+             * owns are withdrawn by AbortTransfer, which matches the transfer
+             * rather than the handle. The one call let through is a PAUSED
+             * from a superseded handle that still owns queued work: that is
+             * usbport cancelling the old handle's transfers, and the early
+             * Stop Endpoint it asks for is what keeps the abort's DMA window
+             * narrow (xhciEpHandleOwnsWork).
+             */
+            ext->EndpointCallsStale++;
+        } else if (dev != NULL && dev->State != XHCI_DEV_STATE_FREE &&
+                   xhciEpResolve(dev, endpoint->Dci, &binding)) {
             if (state == USBPORT_ENDPOINT_PAUSED) {
                 binding.Quiesce->Flags |= XHCI_EPQ_PAUSED;
                 xhciEpArmIfBusy(ext, dev, &binding, 0);
@@ -5706,6 +5836,23 @@ VOID XhciSlotSetEndpointState(PXHCI_EXTENSION ext,
 
             record = xhciEpByDci(dev, endpoint->Dci);
             if (record == NULL) {
+                endpoint->Flags &= ~XHCI_ENDPOINT_FLAG_OPEN;
+                XhciControllerLockRelease(oldIrql);
+                XhciSlotDeferredWork(ext);
+                return;
+            }
+            if (record->EndpointExtension != NULL &&
+                record->EndpointExtension != (PVOID)endpoint) {
+                /*
+                 * The non-default form of the superseded-handle branch above
+                 * (the 2026-09-05 audit's F1, first probe): the record at this
+                 * DCI is bound to a replacement extension, and everything
+                 * below - the pointer, the owed invalidate, the queue, the
+                 * held configuration - is the replacement's. This REMOVE
+                 * closes its own handle and nothing else. A REMOVE with the
+                 * binding already gone (`NULL`) falls through as before.
+                 */
+                ext->EndpointRemovesSuperseded++;
                 endpoint->Flags &= ~XHCI_ENDPOINT_FLAG_OPEN;
                 XhciControllerLockRelease(oldIrql);
                 XhciSlotDeferredWork(ext);
@@ -5827,8 +5974,13 @@ ULONG XhciSlotGetEndpointStatus(PXHCI_EXTENSION ext, PXHCI_ENDPOINT endpoint)
     ext->EndpointStatusQueries++;
     dev = xhciDevFromRef(ext, endpoint->DeviceIndex);
     if (dev != NULL && dev->State != XHCI_DEV_STATE_FREE &&
-        xhciEpResolve(dev, endpoint->Dci, &binding) &&
-        (binding.Quiesce->Flags & XHCI_EPQ_HALTED) != 0) {
+        xhciEpHandleSuperseded(dev, endpoint->Dci, endpoint)) {
+        /* A superseded handle is answered RUN and counted (F1): the halt bit
+         * it would otherwise read belongs to the replacement's pipe. */
+        ext->EndpointCallsStale++;
+    } else if (dev != NULL && dev->State != XHCI_DEV_STATE_FREE &&
+               xhciEpResolve(dev, endpoint->Dci, &binding) &&
+               (binding.Quiesce->Flags & XHCI_EPQ_HALTED) != 0) {
         /*
          * Answered from this driver's own halt bit rather than from a fresh read
          * of the Endpoint Context, and that is deliberate: the bit is set by the
@@ -5872,7 +6024,12 @@ VOID XhciSlotSetEndpointStatus(PXHCI_EXTENSION ext,
     ext->EndpointStatusRunRequests++;
     dev = xhciDevFromRef(ext, endpoint->DeviceIndex);
     if (dev != NULL && dev->State != XHCI_DEV_STATE_FREE &&
-        xhciEpResolve(dev, endpoint->Dci, &binding)) {
+        xhciEpHandleSuperseded(dev, endpoint->Dci, endpoint)) {
+        /* A reset-pipe through a superseded handle would reset the
+         * replacement's pipe (F1); declined and counted. */
+        ext->EndpointCallsStale++;
+    } else if (dev != NULL && dev->State != XHCI_DEV_STATE_FREE &&
+               xhciEpResolve(dev, endpoint->Dci, &binding)) {
         PXHCI_EP_QUIESCE quiesce;
 
         quiesce = binding.Quiesce;
@@ -6997,6 +7154,20 @@ static MPSTATUS xhciSlotSubmitNonDefault(
                                "dci", endpoint->Dci);
         return MP_STATUS_SUCCESS;
     }
+    if (record->EndpointExtension != (PVOID)endpoint) {
+        /*
+         * Bound, but to a different extension: this handle has been replaced
+         * (F1). Equally permanent - the old handle never becomes the bound one
+         * again - and failed the same way, so the work never reaches the
+         * replacement's queue.
+         */
+        xhciDevFailTransfer(ext, endpoint, transfer, parameters,
+                            XHCI_USBD_STATUS_CANCELED);
+        ext->TransfersFailedStale++;
+        XHCI_DBG_VALUE_CHANGED("slot: transfer failed - stale endpoint "
+                               "handle, dci", endpoint->Dci);
+        return MP_STATUS_SUCCESS;
+    }
 
     if (record->State == XHCI_EP_REC_PENDING ||
         record->State == XHCI_EP_REC_CONFIGURING) {
@@ -7156,6 +7327,14 @@ static MPSTATUS xhciSlotSubmitIsoNonDefault(
                                isoParams,
                             XHCI_USBD_STATUS_CANCELED);
         ext->TransfersFailedGone++;
+        return MP_STATUS_SUCCESS;
+    }
+    if (record->EndpointExtension != (PVOID)endpoint) {
+        /* A replaced handle (F1): permanent, failed like the bulk form. */
+        xhciDevFailIsoTransfer(ext, endpoint, transfer, parameters,
+                               isoParams,
+                               XHCI_USBD_STATUS_CANCELED);
+        ext->TransfersFailedStale++;
         return MP_STATUS_SUCCESS;
     }
     if (!xhciEpTypeIsIsoch(record->Params.EpType)) {
@@ -7548,6 +7727,26 @@ MPSTATUS XhciSlotSubmitTransfer(PXHCI_EXTENSION ext,
         xhciDevTransferRefused(ext, dev, 0);
         XhciControllerLockRelease(oldIrql);
         return MP_STATUS_NO_RESOURCES;
+    }
+    if (dev->EndpointExtension != (PVOID)endpoint) {
+        /*
+         * EP0 is open - through a *different* extension. This handle was
+         * superseded by the two-handle restore (issue 4) and usbport has
+         * already been told, through that handle's own REMOVE, that it is
+         * closed; work offered through it now belongs to nobody and must not
+         * reach the live handle's queue (the 2026-09-05 audit's F1, third
+         * probe). Permanent, so failed rather than refused: the old handle
+         * never becomes the bound one again, and a retry would loop for ever
+         * on the rule the comment at the top of this function records.
+         */
+        xhciDevFailTransfer(ext, endpoint, transfer, parameters,
+                            XHCI_USBD_STATUS_CANCELED);
+        ext->TransfersFailedStale++;
+        XHCI_DBG_VALUE_CHANGED("slot: transfer failed - stale EP0 handle, "
+                               "device index", endpoint->DeviceIndex);
+        XhciControllerLockRelease(oldIrql);
+        XhciSlotDeferredWork(ext);
+        return MP_STATUS_SUCCESS;
     }
 
     if (xhciDevIsSetAddress(parameters)) {
@@ -9885,7 +10084,7 @@ static ULONG xhciDevPumpCommand(PXHCI_EXTENSION ext)
         /*
          * The record is picked here and not by the caller, because "which
          * endpoint owes one" is only answerable under the lock and the pump is
-         * the only thing holding it at this point. `ConfigureDci` is what the
+         * the only thing holding it at this point. `EndpointOpDci` is what the
          * completion resolves it back through - the record pointer itself must
          * not be carried across the unlock.
          */

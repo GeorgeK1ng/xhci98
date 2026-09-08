@@ -75,7 +75,7 @@ stack natively in SP4. This driver fills the gap for both.
 | USB scope | USB 2.0 (HS/FS/LS) only; HID, mass storage, USB Ethernet, and USB Audio validation targets. USB 3.0 SuperSpeed is out of scope (see `docs/usb-xhci-info/xhci-programming.md`, "What SuperSpeed Support Would Require") |
 | Integration model | `usbport.sys` miniport (Option A) - reuse the USB 2.0 stack already on the target (NUSB's Win2000-derived build, SP4's native one, or SweetLow's XP-derived rebuild on Windows 98); do not re-implement the USB stack |
 | Compiler | MSVC 6.0, run in place from `tools/MSVC600` (unpacked from `tools/MSVC600.zip`) |
-| DDK | Windows 2000 DDK, unpacked into `tools/ntddk` (from `tools/WIN2KDDK.EXE`). Both toolchains live in the repo and install nothing machine-wide; every script finds them relative to itself, and `DDKROOT`/`MSVC6` override |
+| DDK | Windows 2000 DDK, unpacked into `tools/ntddk` (from `tools/WIN2KDDK.EXE`). Both toolchains live in the repo and install nothing machine-wide; every script finds them relative to itself. `DDKROOT` overrides where the DDK is found and reaches its `setenv.bat`, so it does redirect the compiler the driver is built with. `MSVC6` does NOT: the DDK build takes its compiler from the generated environment script, and `MSVC6` only redirects the host-side tools that need `dumpbin` and `cl` of their own - the import gate and `scripts\vm-matrix\gen-offsets.ps1` |
 | Language | C (C89/C90 compatible with MSVC 6.0) |
 | Driver type | WDM kernel-mode driver (.sys) |
 | Hardware spec | xHCI 1.2c. Transcribed in `docs/usb-xhci-info/xhci-data-structures.md`; the PDF itself is fetched per-machine into the git-ignored `docs/references/` (see its README) |
@@ -97,15 +97,17 @@ xhciqual/       Phase 0 DOS hardware-qualification tool (Open Watcom).
                 that roadmap checkpoints cite as evidence. Tracked.
 xhcisnap/       The host-side reader for the driver's log channel
                 (`XHCISNAP.EXE`); `xhcisnap/README.md` is its guide. Tracked.
+images/         The pictures `README.md` embeds. Tracked.
 docs/           The documentation tree: using/ (release notes, the release
                 acceptance test), contributing/ (roadmap, architecture,
                 build/test/runbooks, design records, run sheets and their
-                evidence), issues/, usb-xhci-info/, and references/.
+                evidence), issues/, future-plans/ (proposals not
+                scheduled), usb-xhci-info/, and references/.
                 `docs/README.md` is the index, and every document below is
                 reachable from it.
 tools/          The build toolchain itself, used in place and installed
                 nowhere else (`MSVC600/`, `ntddk/`), plus the archives they
-                were unpacked from, the NUSB 3.3 package, and the
+                were unpacked from, the NUSB 3.3 and 3.6 packages, and the
                 `*-extracted/` shipping binaries every ABI derivation is read
                 from. Git-ignored except `tools/w98se.url.example`, the
                 template that tells a clone where to point the DOS harnesses
@@ -240,12 +242,15 @@ what Win2000 enforces; power/PnP/locking behaviour that "works" on Win98 is
 frequently just unexercised there. Never close a phase on a Win98-only
 observation.
 
-Use `ExAllocatePool`, never `ExAllocatePoolWithTag`; the import gate denies
-both tagged names. This is policy rather than a missing export: Option A
-needs no private pool at all, so prefer embedding fixed software metadata in
-the usbport-allocated miniport/common-buffer extensions. (The DDK's
-`POOL_TAGGING` rewrite of `ExAllocatePool` is undone in the compatibility
-header.)
+Allocate no pool at all. The import allowlist has no row for
+`ExAllocatePool` or for either tagged name, so a call to any of them fails the
+import gate as "not in the allowlist", and a row would need Windows 98
+evidence that none is intended to supply. This is policy rather than a
+missing export: Option A needs no private pool, so fixed software metadata is
+embedded in the usbport-allocated miniport/common-buffer extensions. (The
+DDK's `POOL_TAGGING` rewrite of `ExAllocatePool` is undone in the
+compatibility header so the untagged name is what a stray call would resolve
+to and be refused on.)
 
 See `docs/usb-xhci-info/win98-wdm.md` ("Imports are a silent load-time gate"
 and "Windows 2000 as a co-primary target") and
@@ -301,21 +306,26 @@ that reason, including the Win98-parser traps its engine reports as nothing
 at all.
 
 The media carries no Microsoft file. `usbd.sys` and `usbhub.sys` (both
-targets) and `usbport.sys` (the NT targets; on Windows 98 the USB 2.0 stack
-places it) are the OS's own, and nothing on an xHCI-only machine ever placed
-them, so the INF has the setup engine copy them from the OS's own install
-source through `LayoutFile=layout.inf`, never overwriting a file already
-there; on an xHCI-only Windows 98 machine that means the Windows 98 CD may
-be asked for, and the NT targets take them from `Driver Cache\i386` with no
-prompt. `usbhub20.sys` is on no path: the OS places it itself. Do not put
-any of them on the media under any name: the INF gate's `OS-*` and
-`PKG-MSFILE` rules refuse it, and `legal-provenance.md` section 5 records
-why. Build install media with `scripts\package\make-package.ps1`, never by
+targets), `usbport.sys` (the NT targets; on Windows 98 the USB 2.0 stack
+places it) and, since 1.0.2.0, `usbui.dll` (all four targets, the root hub's
+property-page provider) are the OS's own, and nothing on an xHCI-only machine
+ever placed them, so the INF has the setup engine copy them from the OS's own
+install source through `LayoutFile=layout.inf`, never overwriting a file
+already there; on an xHCI-only Windows 98 machine that means the Windows 98 CD
+may be asked for, and the NT targets take them from `Driver Cache\i386` with no
+prompt. The three drivers go to dirid 10 (`System32\Drivers`) and `usbui.dll`
+alone to dirid 11 (`System32`), which the INF gate holds it to. `usbhub20.sys` is on no path: the OS places it itself. Do not put
+any of them on the media: the INF gate's `OS-*` rules refuse an INF that names
+one, and `PKG-MSFILE` refuses a staged package holding one - by name, which
+covers the four, the three retired 1.0.0.0 media names and `usbhub20.sys`. A
+name list cannot see the same bytes under a name nobody thought of; what closes
+that is the packager refusing to publish anything it did not itself stage.
+`legal-provenance.md` section 5 records why. Build install media with `scripts\package\make-package.ps1`, never by
 hand-copying the `.sys` and `.inf`.
 
 See `docs/contributing/build-and-test.md` for environment setup, QEMU
 configuration, the install procedure, the two model INFs, and "The files the
-OS supplies: `usbport.sys`, `usbd.sys` and `usbhub.sys`";
+OS supplies: `usbport.sys`, `usbd.sys`, `usbhub.sys` and `usbui.dll`";
 `docs/usb-xhci-info/win98-wdm.md`
 for the WDM API
 compatibility table and the "MSVC 6.0 / C89 Language Pitfalls" list.
@@ -358,8 +368,9 @@ rules that bind day-to-day work, and none of them is optional.
   the assembled asset carried three (`usbd98.sys`, `usbd2k.sys`,
   `usbhub98.sys`), by a decision `legal-provenance.md` section 5 records, and
   that was withdrawn on 2026-09-02 before any upload: release 1.0.0.1 has the
-  OS supply both files through the INF's `LayoutFile`, and 1.0.1.0 adds
-  `usbport.sys` on the NT path by the same route. **Do not put a
+  OS supply both files through the INF's `LayoutFile`, 1.0.1.0 adds
+  `usbport.sys` on the NT path by the same route, and 1.0.2.0 adds `usbui.dll`
+  on all four paths by it, to dirid 11 rather than 10. **Do not put a
   Microsoft file back onto the media, under any name, without a decision
   recorded there**, and do not write "this project redistributes nothing"
   anywhere: the two tool executables carry statically linked runtimes

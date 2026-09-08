@@ -74,6 +74,28 @@
         'zero interrupt mask failures'
         'zero commands the engine gave up on'
 
+        # THIS DRIVER REFUSING A FUNCTION DRIVER'S REQUEST.  None of these can
+        # move until something above usbport has selected a configuration and
+        # asked for a pipe, so each is a defect in THIS driver's handling of a
+        # device the OS did claim - never the OS's silence, which is what the
+        # NODRIVER inference reads from `endpoints opened` staying at zero.
+        # The 2026-09-05 audit (roadmap Phase 20, F3, F9) showed the evaluator
+        # reading a ring-pool refusal as NODRIVER and a Configure Endpoint
+        # failure after an accepted open as PASS, because `endpoints opened`
+        # advances when the open is accepted, before the command has run, and
+        # no expectation named these counters.  lib\verdict.ps1 now gives
+        # refusal evidence precedence on its own; these rows put a line for
+        # each in the report.  `endpoint refusals - not ready` is deliberately
+        # absent: it is the one transient refusal (usbport retries it), and
+        # the evaluator judges it by whether an open then landed.
+        'zero endpoint refusals - type'
+        'zero endpoint refusals - no device'
+        'zero endpoint refusals - params'
+        'zero endpoint refusals - ring pool'
+        'zero endpoint configure failures'
+        'zero endpoints refused - no bandwidth'
+        'zero endpoints refused - no resources'
+
         # The nine-term open-accounting identity, transcribed from src\xhci.h's
         # own statement of it.  `EP0 opens refused - no route` is a SHARE of
         # `EP0 opens refused` and is deliberately absent.
@@ -81,6 +103,71 @@
     )
 
     Groups = @(
+
+        # -------------------------------------------------------------------
+        # FIRST, since 2026-09-07 (the owner's call under roadmap 20.8): the
+        # usb-audio replug row is judged at the run's first boot, not its
+        # fifth. Groups run in this file's order; nothing else depends on it.
+        @{
+            Name = 'audio'
+            Description = 'The isochronous path. Its own group because on Windows 98 this device bugchecks the guest, and a group boundary is the blast radius.'
+            Pump = $true
+            Rows = @(
+                @{
+                    Name = 'usb-audio/fs'
+                    Model = 'usb-audio'
+                    # The run's `-audiodev none,id=matrixaud` (run-matrix.ps1):
+                    # the default host backend blocked the monitor on the
+                    # 1.0.1.0 post-release run, see the comment there.
+                    AddArgs = 'audiodev=matrixaud'
+                    Settle = 35
+                    Expect = @( 'advance endpoints opened >= 1' )
+                    # Per-target additions.  These are the only predicted bind
+                    # outcomes in the whole file, and both are predicted because
+                    # they were MEASURED in batch 9-V rather than guessed.
+                    ExpectByTarget = @{
+                        # AN UNATTENDED RUN PLAYS NOTHING, AND THAT IS WHY THESE
+                        # ARE INERT RATHER THAN ADVANCE.  A first version of this
+                        # row asserted `advance iso submits` on 2b, on the
+                        # strength of batch 9-V having measured 250,330 packets
+                        # there - and the run duly reported FAIL.  The mistake is
+                        # instructive: batch 9-V's isochronous traffic came from
+                        # a 48 kHz tone being PLAYED into the device, by an
+                        # operator, with a wav capture as the oracle.  Attaching
+                        # a usb-audio device and waiting produces an idle audio
+                        # endpoint and no isochronous traffic whatsoever.
+                        #
+                        # So the matrix does not claim the isochronous path here.
+                        # Design doc 06 section 7 already says this harness does
+                        # not judge audio, because the traced build's own
+                        # per-line output is what stutters a stream on this
+                        # vehicle - the `qemu` flavour since task 13-L.1, which
+                        # is the one this harness runs; this
+                        # is the same boundary met from the other side.  Phase 9's
+                        # hand-run with a capture remains the oracle, and these
+                        # counters are recorded as structurally zero HERE rather
+                        # than quietly dropped, so the row cannot read as a pass.
+                        '2b' = @(
+                            'inert iso packets answered because nothing in an unattended run plays audio - batch 9-V needed a tone and a wav capture, and an idle usb-audio endpoint moves no isochronous traffic at all'
+                            'zero iso missed service errors'
+                            'zero iso packet errors'
+                        )
+                        # Windows 98 SE's own USBAUDIO.VXD divides by zero after
+                        # exactly one 10 ms URB - reproduced four times in batch
+                        # 9-V, twice through a UHCI control with this driver
+                        # idle-suspended and every isochronous counter at 0.
+                        # The path exists but the target destroys itself on it,
+                        # so the row is inert here rather than expected to fail.
+                        '2a' = @(
+                            'inert iso packets answered because Windows 98 SE USBAUDIO.VXD faults after one URB - exonerated in batch 9-V through a UHCI control'
+                        )
+                    }
+                    # This row is expected to be able to kill the 2a guest.  The
+                    # runner treats that as the end of the GROUP, not the run.
+                    MayWedgeGuest = @('2a')
+                }
+            )
+        }
 
         # -------------------------------------------------------------------
         @{
@@ -133,12 +220,15 @@
                     # Phase 10's whole-matrix 2b run read NODRIVER for both
                     # mouse rows while the keyboards and the tablet bound: a
                     # second pointer beside the keep-alive mouse is what that
-                    # guest did not claim.  Written as measured; the first
-                    # fresh run says whether an SP4 with no history does the
-                    # same.
-                    ExpectNoDriver = @{
-                        '2b' = 'measured NODRIVER on the carried-along 2b image (a second usb-mouse beside the keep-alive); a fresh SP4 has no class driver that image lacked'
-                    }
+                    # guest did not claim.  **The fresh run answered it: both
+                    # bind.**  Every 2b-fresh post-release run since Phase 16
+                    # has read PASS here and printed "correct the entry"
+                    # alongside, so the reading belonged to that carried-along
+                    # image and not to Windows 2000 SP4.  The entry is removed
+                    # rather than kept as a curiosity (the 2026-09-07 audit's
+                    # H21): an ExpectNoDriver that does not apply waives a
+                    # GENUINE no-driver result on the row silently, which is
+                    # the one thing it must not do.
                 }
                 @{
                     Name = 'usb-mouse/fs'
@@ -149,9 +239,9 @@
                         'advance endpoints opened >= 1'
                         'advance endpoint speed mismatches'
                     )
-                    ExpectNoDriver = @{
-                        '2b' = 'measured NODRIVER on the carried-along 2b image (a second usb-mouse beside the keep-alive); a fresh SP4 has no class driver that image lacked'
-                    }
+                    # As usb-mouse/hs above: the Phase 10 reading was the
+                    # carried-along image's, and every fresh run since has read
+                    # PASS (audit H21).
                 }
                 @{
                     Name = 'usb-tablet/hs'
@@ -192,9 +282,10 @@
                     ExcludedOnTarget = @{
                         '2a' = 'excluded with usb-tablet/hs - the same absolute-pointer install path, never taught to the image for that reason'
                     }
-                    ExpectNoDriver = @{
-                        '2b' = 'measured NODRIVER on the carried-along 2b image; Windows 2000 SP4 ships no driver for a Wacom tablet'
-                    }
+                    # An ExpectNoDriver saying SP4 ships no Wacom driver stood
+                    # here and was wrong: every 2b-fresh run reads PASS, so SP4
+                    # binds this device through its own HID class driver and the
+                    # Phase 10 reading was the carried-along image's (audit H21).
                 }
             )
         }
@@ -488,68 +579,6 @@
                     ExpectNoDriver = @{
                         '2b' = 'measured NODRIVER on the carried-along 2b image; a HID with no boot interface that Windows 2000 did not claim'
                     }
-                }
-            )
-        }
-
-        # -------------------------------------------------------------------
-        @{
-            Name = 'audio'
-            Description = 'The isochronous path. Its own group because on Windows 98 this device bugchecks the guest, and a group boundary is the blast radius.'
-            Pump = $true
-            Rows = @(
-                @{
-                    Name = 'usb-audio/fs'
-                    Model = 'usb-audio'
-                    # The run's `-audiodev none,id=matrixaud` (run-matrix.ps1):
-                    # the default host backend blocked the monitor on the
-                    # 1.0.1.0 post-release run, see the comment there.
-                    AddArgs = 'audiodev=matrixaud'
-                    Settle = 35
-                    Expect = @( 'advance endpoints opened >= 1' )
-                    # Per-target additions.  These are the only predicted bind
-                    # outcomes in the whole file, and both are predicted because
-                    # they were MEASURED in batch 9-V rather than guessed.
-                    ExpectByTarget = @{
-                        # AN UNATTENDED RUN PLAYS NOTHING, AND THAT IS WHY THESE
-                        # ARE INERT RATHER THAN ADVANCE.  A first version of this
-                        # row asserted `advance iso submits` on 2b, on the
-                        # strength of batch 9-V having measured 250,330 packets
-                        # there - and the run duly reported FAIL.  The mistake is
-                        # instructive: batch 9-V's isochronous traffic came from
-                        # a 48 kHz tone being PLAYED into the device, by an
-                        # operator, with a wav capture as the oracle.  Attaching
-                        # a usb-audio device and waiting produces an idle audio
-                        # endpoint and no isochronous traffic whatsoever.
-                        #
-                        # So the matrix does not claim the isochronous path here.
-                        # Design doc 06 section 7 already says this harness does
-                        # not judge audio, because the traced build's own
-                        # per-line output is what stutters a stream on this
-                        # vehicle - the `qemu` flavour since task 13-L.1, which
-                        # is the one this harness runs; this
-                        # is the same boundary met from the other side.  Phase 9's
-                        # hand-run with a capture remains the oracle, and these
-                        # counters are recorded as structurally zero HERE rather
-                        # than quietly dropped, so the row cannot read as a pass.
-                        '2b' = @(
-                            'inert iso packets answered because nothing in an unattended run plays audio - batch 9-V needed a tone and a wav capture, and an idle usb-audio endpoint moves no isochronous traffic at all'
-                            'zero iso missed service errors'
-                            'zero iso packet errors'
-                        )
-                        # Windows 98 SE's own USBAUDIO.VXD divides by zero after
-                        # exactly one 10 ms URB - reproduced four times in batch
-                        # 9-V, twice through a UHCI control with this driver
-                        # idle-suspended and every isochronous counter at 0.
-                        # The path exists but the target destroys itself on it,
-                        # so the row is inert here rather than expected to fail.
-                        '2a' = @(
-                            'inert iso packets answered because Windows 98 SE USBAUDIO.VXD faults after one URB - exonerated in batch 9-V through a UHCI control'
-                        )
-                    }
-                    # This row is expected to be able to kill the 2a guest.  The
-                    # runner treats that as the end of the GROUP, not the run.
-                    MayWedgeGuest = @('2a')
                 }
             )
         }

@@ -1,7 +1,7 @@
 # xhci98 - Release Notes
 
-This file describes package version `1.0.1.0`
-(`DriverVer=09/04/2026,1.0.1.0`), the third release. Where this file and
+This file describes package version `1.0.2.0`
+(`DriverVer=09/07/2026,1.0.2.0`), the fourth release. Where this file and
 `docs/contributing/roadmap.md`, `docs/contributing/build-and-test.md` or
 `xhciqual/README.md` disagree, the other document wins and this one is the
 copy to fix.
@@ -36,8 +36,8 @@ you would be the first. Windows ME stands where Windows 2000 does: supported
 in virtual machines only, observed once (2026-09-02) under SweetLow's USB 2.0
 stack, the only stack it is supported with, with the driver loading and a
 HID mouse, a mass-storage device and a composite audio device binding. It
-has never run on real hardware either. So does 32-bit Windows XP, since this
-release: supported in virtual machines only, observed in one QEMU guest (XP
+has never run on real hardware either. So does 32-bit Windows XP, since
+`1.0.1.0`: supported in virtual machines only, observed in one QEMU guest (XP
 Professional SP3, 2026-09-03) on which the package installed with the xHCI
 alone and no prompt, the driver started under XP's own USB stack, a HID
 mouse, a mass-storage device and a composite audio device bound, and the
@@ -59,8 +59,9 @@ real hardware.
   SE does not check; Windows 2000 SP4 and Windows XP show an unsigned-driver
   warning during install and then install it (on XP, choose Continue Anyway).
 - On Windows 98 it is not standalone. Windows 98 has no `usbport.sys` of its
-  own. **NUSB must be installed first**; it is what places `usbport.sys`
-  and `usbhub20.sys`. Without it the driver will not load, with no useful
+  own. **A USB 2.0 stack must be installed first**, NUSB (the one this
+  project tests against) or SweetLow's; it is what places `usbport.sys` and
+  `usbhub20.sys`. Without one the driver will not load, with no useful
   diagnostic. NUSB 3.3 is the version this project tests against. NUSB 3.6
   carries the same USB 2.0 stack byte for byte and has been observed working
   with this driver (HID and mass storage, in a virtual machine only). A third
@@ -80,7 +81,7 @@ real hardware.
 | Operating system | Windows 98 SE (4.10.2222) or Windows 2000 SP4; Windows ME (4.90.3000) and 32-bit Windows XP (SP3) in virtual machines only, see "What this is". |
 | USB stack | Windows 98: NUSB 3.3, installed before this driver (NUSB 3.6 ships the identical USB 2.0 stack and has been observed working, in a virtual machine only; so has the SweetLow stack that Windows 98 QuickInstall 1.0.1 and later bundle, which also removes the first known limitation below; see the README's installation steps). Windows ME: SweetLow's stack only; its own USB stack has no `usbport.sys`, and on it the driver installs and shows Code 2. Do not install NUSB on Windows ME, it is a Windows 98 SE package. Windows 2000: SP4's native stack, or the standalone USB 2.0 update KB319973. **Do not install NUSB on Windows 2000.** Windows XP: its own USB stack, nothing to install; NUSB is not for it either. |
 | Controller | An xHCI controller presenting PCI class code `0C0330`, with at least one USB 2.0 protocol port, a BAR0 mapped below 4 GB, and a legacy interrupt pin. Neither target has an MSI path, so a controller reporting `Interrupt Pin = 0` cannot be driven at all. |
-| Install media | Windows 98 SE on an xHCI-only machine: the Windows 98 SE installation CD at hand, or the Windows CABs on the hard disk (`C:\WINDOWS\OPTIONS\CABS`). The install copies Windows' own `usbd.sys` and `usbhub.sys` from it. Windows ME: the same, from the Windows ME CD or the CABs its Setup leaves on the hard disk; the virtual machine tried asked for nothing. Windows 2000 and Windows XP: nothing; `usbport.sys`, `usbd.sys` and `usbhub.sys` come from the driver cache every install has (`sp4.cab` and `sp3.cab` respectively). |
+| Install media | Windows 98 SE on an xHCI-only machine: the Windows 98 SE installation CD at hand, or the Windows CABs on the hard disk (`C:\WINDOWS\OPTIONS\CABS`). The install copies Windows' own `usbd.sys`, `usbhub.sys` and `usbui.dll` from it. Windows ME: the same, from the Windows ME CD or the CABs its Setup leaves on the hard disk; the virtual machine tried asked for nothing. Windows XP: nothing; `usbport.sys`, `usbd.sys`, `usbhub.sys` and `usbui.dll` all come out of `sp3.cab` in the driver cache every install has. Windows 2000: nothing either; the same three out of `sp4.cab`, and `usbui.dll` out of `driver.cab` beside it in that cache. |
 
 Run the qualifier before installing anything; it answers all three of the
 controller conditions in a single read-only pass.
@@ -117,7 +118,7 @@ and how to read each result.
 The package is a directory holding two files, `xhci98.inf` and
 `xhci98.sys`, and no Microsoft file.
 
-- Windows 98 SE: install NUSB 3.3e or the newer SweetLow stack first, your
+- Windows 98 SE: install NUSB 3.3 or the newer SweetLow stack first, your
   choice (README, installation steps). Then Device
   Manager -> the unrecognised xHCI device -> *Update Driver* -> *Specify a
   location* -> the package directory.
@@ -129,27 +130,50 @@ The package is a directory holding two files, `xhci98.inf` and
   from SweetLow's site, unzipped; right-click the `USB2.INF` at its root,
   *Install*, reboot. Then the Windows 98 SE route above.
 
-Three files the driver depends on are not in the package because they are
+Four files the driver depends on are not in the package because they are
 Windows' own: `usbd.sys`, which the USB 2.0 root hub imports on both
 targets; `usbhub.sys`, the driver for composite devices on Windows 98 and
-the hub driver on Windows 2000 and XP; and, on Windows 2000 and XP,
+the hub driver on Windows 2000 and XP; on Windows 2000 and XP,
 `usbport.sys`, the
 USB stack this driver plugs into (on Windows 98 NUSB or SweetLow's package
-supplies it). Windows places its USB files only when Setup finds a USB
-controller it recognises, and an xHCI-only machine has none of them, so the
-INF asks Windows to copy each from its own installation source, and only if
-it is absent; a machine that ever had a USB controller Windows recognised
-keeps its own files and is asked for nothing.
+supplies it); and `usbui.dll`, the USB property-page DLL. Windows places its
+USB files only when Setup finds a USB controller it recognises, and an
+xHCI-only machine has none of them, so the INF asks Windows to copy each from
+its own installation source, and only if it is absent; a machine that ever had
+a USB controller Windows recognised keeps its own files and is asked for
+nothing.
+
+`usbui.dll` is new in this release and is the one that is purely cosmetic. On
+Windows 2000 and Windows XP, Windows' own INF already asks for a Power tab on
+the USB Root Hub's properties and names that DLL as the page's provider; on a
+machine that never had a USB controller the file is missing, so the tab is
+silently absent. Copying it back gives you the tab, showing the hub's power
+budget and what is attached. On Windows 98 and Windows ME it changes nothing
+visible: that page comes from `sysclass.dll` there, which those systems
+already have.
 
 On an xHCI-only Windows 98 machine that means an "Insert Disk" prompt naming
 the Windows 98 Second Edition CD-ROM during the copy, unless the Windows
 CABs are on the hard disk (OEM and Windows 98 QuickInstall installs). Insert
 the CD and click OK; if it then asks where to copy from, give it the CD's
-`WIN98` folder. Windows 2000 and Windows XP take all three from their driver
-cache and ask for nothing. If the prompt is cancelled the driver still installs, but the
-USB 2.0 Root Hub sits at Code 2 (Windows 2000: a `0xc0000034` error naming
-`usbhub20.sys`); that reads as a fault in this driver and is not one. Put
-the CD in and install the driver again.
+`WIN98` folder. If the prompt is cancelled the driver still installs, but the
+USB 2.0 Root Hub sits at Code 2; that reads as a fault in this driver and is
+not one. Put the CD in and install the driver again.
+
+An upgrade from an earlier release can raise that prompt on a machine whose
+previous install did not, and that is expected rather than a fault.
+`usbui.dll` is new in `1.0.2.0`, so a Windows 98 or Windows ME machine that
+already has `usbd.sys` and `usbhub.sys` from an earlier install may still not
+have it. It sits on the same cabinet as those two, so the same CD answers it.
+
+Windows 2000 and Windows XP take theirs from the driver cache
+every install has and ask for nothing: on Windows XP all four out of
+`sp3.cab`, on Windows 2000 three out of `sp4.cab` and `usbui.dll` out of
+`driver.cab` beside it. Measured on Windows 2000 on 2026-09-07, installing on
+a machine that had never had a USB controller: no prompt of any kind, and
+therefore nothing to cancel. Should the files be missing anyway, the failure
+looks the same as the cancelled 9x prompt above, spelled as a `0xc0000034`
+error naming `usbhub20.sys` rather than as Code 2.
 
 `docs/contributing/build-and-test.md` has the full procedure, the recovery
 rungs, and the bootstrap path for a machine that has no working USB until this
@@ -245,12 +269,36 @@ because a user meets them through this driver.
   then power-cycle. Recovery is complete and loses nothing.
 - The package writes `DisableSelectiveSuspend = 1` under
   `HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\USB`, a machine-wide
-  setting, on both targets, because a sleeping xHCI controller cannot report
+  setting, on all four targets, because a sleeping xHCI controller cannot report
   a newly plugged device and Windows 98 otherwise idles it within a second
-  (Windows XP within about half a minute; Windows 2000 never does, and the
-  value changes nothing there). It also stops any other USB controller
+  once nothing at all is on the bus (any attached device keeps it awake,
+  even one with no driver, so a laptop with internal USB devices never idles
+  it and the value changes nothing visible there; Windows XP idles it within
+  about half a minute of a start with nothing attached;
+  Windows 2000 SP4's own stack was never seen idling it, with or without
+  the value, measured in a virtual machine on 2026-09-06). It also
+  stops any other USB controller
   idling, it slightly raises power draw, and an uninstall does not remove
-  it; delete the value by hand if you want the previous behaviour back.
+  it; delete the value by hand (or set it to 0, which has the same effect)
+  if you want the previous behaviour back.
+- Every device plugged directly into a root port is reported to Windows as
+  High Speed, whatever it is; Device Manager and USB tools show it so. This
+  is deliberate: the USB stack this driver plugs into crashes the machine
+  when a Full or Low Speed device is reported at its true speed on a root
+  port (it looks up a transaction translator that does not exist), so the
+  driver keeps the real speed to itself and programs the controller with it,
+  which is why such devices work. Two consequences. Windows sizes a Full or
+  Low Speed device's interrupt polling interval on High-Speed rules, and the
+  driver then raises it to the 1 ms minimum those speeds allow, so a mouse
+  or keyboard on a root port polls in three bands: `bInterval` 1 to 4 at
+  1 ms (1000 Hz), 5 at 2 ms (500 Hz), 6 and above at 4 ms (250 Hz), a stock
+  mouse included. A polling-rate tool that changes `bInterval` within a band
+  shows no effect and one that crosses a band does; nothing slower than 4 ms
+  and nothing faster than 1 ms is reachable there. Devices behind a hub
+  report their true speed and poll at the interval they ask for, so a mouse
+  on a hub polls at its own 8 ms and a polling-rate tool works as on any
+  controller. Measured in a virtual machine with SweetLow's hidusbf; the
+  bands are documented in full in `docs/issues/06-full-speed-root-port-bugcheck.md`.
 - Windows 98: plugging and unplugging a device very fast and repeatedly (one
   cycle every 0.6 s for minutes) can freeze the machine with no error. This
   one is this driver's own defect, with no explanation yet. Normal plugging
@@ -262,23 +310,33 @@ because a user meets them through this driver.
   `XHCIQUAL xhci --probe-only`), waking from standby rebuilds the USB bus
   instead of restoring it: every device is dropped and found again, slower
   and visible but with nothing lost. The counter is `SavesDeclinedNoFsc`.
-  A real standby and wake has not been run anywhere.
+  A real standby and wake has not been run anywhere, and the other half
+  of the same path is unobserved too: on a controller whose restore does
+  succeed, the driver now restores the interrupt moderation it saved
+  rather than leaving it at zero, and that has been read only through a
+  host model, because the virtual machines fail every restore and rebuild
+  the bus instead.
 - Windows 98 shows no driver version on the Driver tab, only the file date;
-  the four-part version is under *Driver File Details*. USB Audio on Windows
-  98 is uneven with the emulated device in the virtual machine: on a freshly
-  installed guest it binds on its first arrival, and a second arrival on the
-  same port stops on a Windows 98 prompt for the installation CD (measured
-  twice on 2026-08-30 in the unattended post-release run); on the older,
-  carried-along guest it failed inside that system's own `USBAUDIO.VXD`. A
-  physical UAC 1.0 device played clean on a ThinkPad E460, directly and
-  behind a High-Speed hub. Both readings are that system's audio stack, not
-  this driver, which addressed the device and opened its endpoints each time
-  Windows asked.
+  the four-part version is under *Driver File Details*.
+- USB Audio on Windows 98 is uneven with the emulated device. The fresh-guest
+  replug stopped on an installation-CD prompt in the 2026-08-30 run. Both
+  arrival and replug subsequently passed in Phase 19 and in Phase 20's solo
+  and paired runs with the audio group first. Earlier Phase 20 runs failed
+  the replug without a prompt: the connect change was announced, but the
+  stack never requested a port reset. Those failures depended on the VM
+  run conditions; no driver defect was established. These later passes
+  supersede the CD prompt as the latest result, not as a guarantee for every
+  guest configuration. An older guest failed inside `USBAUDIO.VXD`; a
+  physical UAC 1.0 device played clean on a ThinkPad E460, directly and behind
+  a High-Speed hub. Roadmap task 19.8 and `docs/contributing/runs/run-20.md`
+  retain the run details; `docs/contributing/lessons.md` has what the Phase 20
+  failures were isolated to.
 - Windows 98 on an xHCI-only machine: the driver install asks for the
   Windows 98 SE CD (an "Insert Disk" prompt naming the Windows 98 Second
   Edition CD-ROM) unless the Windows CABs are on the hard disk. That is
-  Windows fetching its own `usbd.sys` and `usbhub.sys`, which the package
-  does not carry; see "Installing". Cancelling the prompt leaves the USB 2.0
+  Windows fetching its own `usbd.sys`, `usbhub.sys` and `usbui.dll`, which the
+  package does not carry; see "Installing". An upgrade can raise it where the
+  previous install did not, because `usbui.dll` is new in `1.0.2.0`. Cancelling the prompt leaves the USB 2.0
   Root Hub at Code 2 until the driver is installed again with the CD at
   hand. Measured on 2026-09-02 in a virtual machine with no CABs on disk.
 
@@ -289,10 +347,10 @@ This driver's own source is under the GNU General Public License, version 2
 record is `docs/contributing/legal-provenance.md`.
 
 `xhci98.sys` and `xhci98.inf` are this project's own work, and they are the
-whole package. The `usbd.sys` and `usbhub.sys` the install needs, and on
-Windows 2000 the `usbport.sys`, are Windows' own and are copied by Windows
-from your own installation source;
-nothing in the download is Microsoft's. (Release `1.0.0.0` carried the two
+whole package. The `usbd.sys`, `usbhub.sys` and `usbui.dll` the install needs,
+and on Windows 2000 and Windows XP the `usbport.sys`, are Windows' own and are
+copied by Windows from your own installation source; no Microsoft file is in
+the download. (Release `1.0.0.0` carried the two
 `usbd.sys` builds and Windows 98 SE's `usbhub.sys` under other names; that
 was withdrawn before any upload. `docs/contributing/legal-provenance.md`
 section 5 has the record.)

@@ -38,17 +38,7 @@ What it proves:
 $ErrorActionPreference = "Stop"
 . (Join-Path (Split-Path -Parent $PSScriptRoot) "common.ps1")
 
-$script:failures = @()
-$script:checks = 0
-
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    $script:checks++
-    if (-not $Condition) {
-        $script:failures += $Message
-        Write-Host "FAIL: $Message" -ForegroundColor Red
-    }
-}
+. (Join-Path (Split-Path -Parent $PSScriptRoot) "test-harness.ps1")
 
 $gate = Join-Path $PSScriptRoot "check-imports.ps1"
 
@@ -66,6 +56,52 @@ $work = Join-Path $tempBase ("xhci98-flavour-rules-test-" + [System.IO.Path]::Ge
 
 try {
     New-Item -ItemType Directory -Path $work | Out-Null
+
+    # Exercise the real image matcher with synthetic dumpbin output. No built
+    # image is needed, so split-flavour rows are checked before the first link.
+    & {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($gate, [ref]$null, [ref]$null)
+        foreach ($name in @('Get-ImportPairs', 'Read-AllowFile', 'Test-Image')) {
+            $function = $ast.Find({ param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+            }, $true)
+            . ([scriptblock]::Create($function.Extent.Text))
+        }
+        function Invoke-Dumpbin { @('    HAL.dll', '        0 WRITE_PORT_UCHAR', '    Summary') }
+        function Test-NtkernName { $true }
+        function Add-Failure { param($Message) $script:importFailures += $Message }
+        foreach ($order in @(@('debug', 'qemu'), @('qemu', 'debug'))) {
+            $split = Join-Path $work 'split.allow'
+            Set-Content -LiteralPath $split -Encoding ASCII -Value @(
+                '[imports]',
+                "HAL.dll!WRITE_PORT_UCHAR $($order[0]) required",
+                "HAL.dll!WRITE_PORT_UCHAR $($order[1]) required"
+            )
+            $rules = Read-AllowFile $split
+            foreach ($flavour in @('debug', 'qemu', 'release')) {
+                $script:importFailures = @()
+                Test-Image -Path synthetic -ImageFlavor $flavour -Rules $rules
+                if ($flavour -eq 'release') {
+                    Assert-True ($script:importFailures.Count -eq 1) 'split debug/qemu rows still refuse release'
+                } else {
+                    Assert-True ($script:importFailures.Count -eq 0) "split rows admit $flavour in either order: $($script:importFailures)"
+                }
+            }
+        }
+        foreach ($case in @(
+            @{ Rows = @('HAL.dll!WRITE_PORT_UCHAR all required'); Failures = 0; Name = 'all still admits every flavour' },
+            @{ Rows = @('other.dll!WRITE_PORT_UCHAR qemu optional'); Failures = 1; Name = 'same symbol from a different provider is refused' },
+            @{ Rows = @('HAL.dll!write_port_uchar qemu optional'); Failures = 1; Name = 'symbol matching stays case-sensitive' },
+            @{ Rows = @('HAL.dll!WRITE_PORT_UCHAR debug optional', 'HAL.dll!WRITE_PORT_UCHAR qemu required', 'HAL.dll!Missing qemu required'); Failures = 1; Name = 'a missing required import still fails' },
+            @{ Rows = @('HAL.dll!WRITE_PORT_UCHAR qemu optional', '[deny]', 'WRITE_PORT_UCHAR synthetic denial'); Failures = 1; Name = 'deny still wins over an allowed row' }
+        )) {
+            Set-Content -LiteralPath $split -Encoding ASCII -Value (@('[imports]') + $case.Rows)
+            $rules = Read-AllowFile $split
+            $script:importFailures = @()
+            Test-Image -Path synthetic -ImageFlavor qemu -Rules $rules
+            Assert-True ($script:importFailures.Count -eq $case.Failures) $case.Name
+        }
+    }
 
     # ---------------------------------------------------------------------
     # The grammar, on synthetic files.
@@ -203,6 +239,15 @@ try {
             Assert-True ($row[0].Flavors -eq "all") "$kept must be allowed in every flavour"
         }
     }
+} catch {
+    # An exception mid-suite is a FAILED TEST, not a crashed script. Without
+    # this the run died at the throw with $ErrorActionPreference = "Stop",
+    # printed no summary line, and left the reader to tell a broken harness
+    # from a broken gate by reading a stack trace - while its sibling
+    # test-evidence-manifests.ps1 had recorded exactly this case as a failure
+    # since it was written (the 2026-09-07 audit's J6).
+    $script:failures += $_.Exception.Message
+    Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red
 } finally {
     if (Test-Path -LiteralPath $work) {
         Remove-Item -LiteralPath $work -Recurse -Force

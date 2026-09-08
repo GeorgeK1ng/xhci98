@@ -119,7 +119,8 @@ for an unusable endpoint buffer is unreachable while this driver asks for `0`.
 choose; using fewer slots than the hardware offers is legal and normal. Each
 enabled slot costs a persistent Device Context (2048 B worst case) plus a
 persistent EP0 transfer ring (1024 B, section 3.4), 3 KB per slot, so enabling
-all 64 offered slots would cost 96 KB for capacity nobody will use.
+all 64 offered slots would cost a further 96 KB, for the 32 slots above the
+cap, for capacity nobody will use.
 
 Chosen: `min(HCSPARAMS1.MaxSlots, 32)`. A slot is consumed per device, hubs
 included, so 32 covers a root hub's worth of ports plus several tiers of
@@ -489,7 +490,10 @@ size before the register can be read; a runtime-variable stride would save
 
 ## 5. What Win98 and Win2000 are asked to allocate
 
-`MiniPortResourcesSize` = 409,600 bytes. Applying usbport's own rule from
+`MiniPortResourcesSize` = 409,600 bytes. The committed value is
+`XHCI_DECLARED_RESOURCES_SIZE`; a build may override it through
+`XHCI_PROBE_RESOURCES_SIZE` (`src/xhci_dispatch.c`), which is the knob open
+item 1 below would turn. Applying usbport's own rule from
 section 2:
 
 ```
@@ -514,9 +518,13 @@ The observation that exists is at the old size. Phase 3 tasks 8 and 9 watched
 usbport grant 376,832 bytes on both targets, which is evidence about the
 allocator at that size and not a licence for a larger one. The 32 KB increase
 is small against the fragmentation risk the original figure already carried,
-but it has not been observed on a target; the 7a-V runs owe that observation
-(section 7, open item 1). The allocation is the first thing that fails, and it
-fails before `StartController`.
+It has been observed since. Every controller start from batch 7a-V onward
+discharges it: the allocation is the first thing that fails and it fails
+before `StartController`, so a guest or a machine that reaches
+`StartController` at all has granted the request at the current size. That is
+now thousands of starts across both first-class targets, the Windows ME and
+Windows XP guests, the device matrix and the E460, with no grant failure ever
+recorded. Section 7's open item 1 is closed by that, not by a dedicated run.
 
 The odd 101st page is the 48-byte header's rounding. Sizing the request to
 `k * 4096 - 48` would reclaim it, at the cost of coupling the layout to a
@@ -565,7 +573,9 @@ the pool region, which is lever 3's kind of change rather than a number: it
 puts non-EP0 rings back in endpoint memory, which section 3.6 rejected on
 soundness and not on price. These comparisons establish reduction options, not
 feasibility; Phase 3 tasks 8 and 9 observed the allocation at the pre-pool
-size on both target stacks, and the 7a-V runs owe the observation at this one.
+size on both target stacks, and section 3.6 records how the current size was
+observed in turn - every start from batch 7a-V onward is that observation,
+because the allocation fails before `StartController` is reached at all.
 
 ## 6. Cacheability
 
@@ -588,12 +598,16 @@ Ordering rules stand on their own:
 
 ## 7. Open items
 
-1. The allocation itself. Phase 3 tasks 8/9 asked both targets for 372 KB and
-   both granted it, so that item is discharged at that size. Batch 7a-A raised
-   the request to 404 KB (section 3.6), and no target has been asked for that
-   yet; the 7a-V runs owe the observation. It is the first thing that fails
-   and it fails before `StartController`, so a silent success is not what to
-   look for. Record the granted size on both.
+1. The allocation itself - CLOSED. Phase 3 tasks 8/9 asked both targets for
+   372 KB and both granted it, which discharged this at that size; batch 7a-A
+   then raised the request to 404 KB (section 3.6) and this item was left open
+   because no target had been asked for the larger one. It has been since, and
+   section 3.6 records how: the allocation is the first thing that fails and
+   it fails before `StartController`, so every start from batch 7a-V onward -
+   thousands of them across both first-class targets, the Windows ME and
+   Windows XP guests, the device matrix and the E460 - is an observation that
+   the request was granted at the current size, with no failure ever recorded.
+   No dedicated run is owed.
 2. `Resources->StartVA`/`StartPA` at runtime. `XhciCheckResourceBase()`
    asserts page alignment on both. The Phase 3 spike logs the raw
    `USBPORT_RESOURCES` block anyway (interface doc section 9, open item 4);
