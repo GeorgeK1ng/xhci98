@@ -8,6 +8,12 @@ design is for. Do not put a phase number in the filename, since a design doc
 may span or outlive a phase; note any phase association in the doc's title or
 body instead. Add each new doc to the index below.
 
+A design record describes work that is scheduled or built. A proposal the
+project has not taken up lives in [`../../future-plans/`](../../future-plans/README.md)
+instead, and moves here with the next free number when its work is
+scheduled. Record 10, the SuperSpeed storage proposal, moved there on
+2026-09-07; its number is not reused, so the next record is 11.
+
 ## Index
 
 - [01-hardware-qualification-tool.md](01-hardware-qualification-tool.md) - DOS bare-metal Phase 0 tool that qualifies a candidate xHCI machine (BIOS handoff, bus-master DMA, INTx-in-PIC interrupt delivery, port topology/quirks) before any driver effort is spent on it. The verdict is per-controller and covers both targets; the machine needs neither OS installed.

@@ -87,7 +87,7 @@ evidence.
 
 - One command outstanding at a time. Match every Command Completion Event against the issued TRB's physical address regardless: "The Command TRB Pointer field of the Command Completion Event shall point to the Command TRB that initiated the event" (4.6.1, p.93), so an event naming anything else is either a duplicate or a disagreement about where the ring is, and both are worth counting apart from a completion.
 - Never wait for a command completion inside a usbport callback; callbacks run at DISPATCH_LEVEL under usbport's locks (`docs/usb-xhci-info/usbport-miniport-abi.md` section 7). Issue, ring `DB[0]`, return; complete from the DPC.
-- Every command carries a timeout. Recovery order: CRCR.CA abort -> adopt the dequeue pointer the Command Ring Stopped event reports -> escalate to `UsbPortInvalidateController(RESET)` if CRR stays set ~5 s after CA, or if that reported pointer is one the software ring cannot hold. The full ladder, and why repositioning CRCR is not an available rung, is in `docs/usb-xhci-info/xhci-programming.md` "Command Ring Discipline".
+- Every command carries a timeout. Recovery order: CRCR.CA abort -> adopt the dequeue pointer the Command Ring Stopped event reports (rewriting the abandoned command in place as a No Op Command first when the pointer still names it, roadmap Phase 20, F12) -> escalate to `UsbPortInvalidateController(RESET)` if CRR stays set ~5 s after CA, or if that reported pointer is one the software ring cannot hold. The full ladder, and why repositioning CRCR is not an available rung, is in `docs/usb-xhci-info/xhci-programming.md` "Command Ring Discipline, Timeout, and Abort".
 - **Do not ring `DB[0]` between asserting CA and seeing the Command Ring Stopped event.** "If the Command doorbell is rung before CRR = `0`, (i.e. the ring is not fully stopped), then the behavior is undefined, e.g. the Command Ring may not restart" (Table 5-24 note, p.368). That needs an aborting state distinct from "a command is outstanding", because a Command Aborted event alone does not end it.
 - Write the CRCR pointer field only while CRR = 0; keep a software copy of the ring pointer (the register reads back 0).
 - **Write CA only while CRR = 1, and compose it from a read.** RCS, CS, CA and the pointer all read back as `0`, but CRCR 5:4 are RsvdP (Table 5-24, p.367), the only bits of the register a read can carry anything in, so a read-modify-write is still required.
@@ -164,9 +164,39 @@ code:
 - **The init and reinit sequence is the one exemption**, and it rests on a
   precondition rather than on scope: `XhciInitController` clears
   `XHCI_EXT_FLAG_INITIALIZED` under the lock as its first act and sets
-  `HcInfoStatus` bad on entry, and every other context tests one of those before
-  touching controller state. Do not add a path that touches controller state
-  without such a gate.
+  `HcInfoStatus` bad on entry, and every DISPATCH-level path that touches
+  controller state (DPC, health poll, command submit, interrupt enable) tests
+  one of those before doing so. Do not add a path that touches controller
+  state without such a gate.
+- **The device table is not covered by that exemption.** The slot callbacks
+  read and write `Devices[]` under the controller lock with no admission gate
+  (`xhciDevAdmitted` is consulted after the record is read, and recovery calls
+  the deferred drain deliberately while `INITIALIZED` is clear), so
+  `XhciSlotInit` cancels queued work, zeroes the table and resets the owner
+  and cursor fields inside one hold of the lock, never outside it
+  (roadmap Phase 20, F8). `DeferredBusy` is never written by init: its owner
+  is the drainer that set it, which drops the lock around usbport services,
+  and clearing it from anywhere else admits a second drainer.
+- **A handle is not a binding.** Every endpoint callback names its record
+  through a saved device index and DCI, and both outlive the binding: a second
+  extension can be opened on the same endpoint while the first is still open
+  (issue 4's two-handle restore), and a released record is reused for the next
+  device. So every callback that changes state or accepts work compares the
+  record's `EndpointExtension` with the extension it was given
+  (`xhciEpHandleSuperseded`) before doing either: a superseded `REMOVE`
+  closes its own handle and touches nothing else, a superseded
+  `PAUSED`/`ACTIVE`/status call is counted and declined, and a superseded
+  submit is failed `CANCELED` through the completion contract, never queued
+  and never refused for retry. Superseded means bound to a *different*
+  extension; an unbound record (a `REMOVE` waiting for its reopen) keeps the
+  answers it always had. Two exceptions, both about work the old handle still
+  owns: `AbortTransfer` withdraws a transfer by the transfer's own identity,
+  and a `PAUSED` from a superseded handle that still has a transfer of its own
+  on the shared queue (`xhciEpHandleOwnsWork`) is admitted, because that is
+  usbport cancelling the old handle's work and the early Stop Endpoint is what
+  keeps the abort's DMA window narrow. Its later `ACTIVE` is still declined, so
+  the endpoint stays paused until the bound handle's `ACTIVE` or the health
+  poll's restart (roadmap Phase 20, F1; Phase 20 review, finding 3).
 
 ## Ring Full and Backpressure
 
@@ -190,16 +220,35 @@ code:
 
 ## Fatal Errors
 
-- `CheckController` polls USBSTS.HCE and HSE every invocation. It reads the
+- `CheckController` polls USBSTS.HCE and HSE on every invocation it admits:
+  the health poll declines before reading while `HcInfoStatus` is bad, the
+  controller is already failed, or `INITIALIZED` is clear, and an all-ones
+  read is handled after the read as a window that stopped decoding, not as a
+  fatal report. A declined read is not a failed one. It reads the
   register under the controller lock and escalates after releasing it. A
   check of `ControllerFailed` followed by unsynchronized MMIO is the defect
   closed everywhere else in the driver, and `UsbPortInvalidateController` is a
   usbport service that may not be called under this driver's lock.
 - **Escalate on the transition, not on every poll.** HCE is read-only and HSE
-  is left unacknowledged: clearing an RW1C bit would destroy the one durable
-  record of why the controller failed, on a path that has already decided not
-  to retry in place. So both stay set, and an unlatched poll would queue a
-  reset on every health poll for the life of the driver.
+  is left unacknowledged by the poll: clearing an RW1C bit would destroy the
+  one durable record of why the controller failed before the recovery has
+  run. So both stay set while the recovery is pending. The latch
+  (`ControllerFatal`) is what stops the polls still admitted before
+  `ResetController` closes admission, and every poll should that call never
+  arrive, from asking usbport for a reset each time; once
+  `ControllerFailed` is set the poll declines before reading, as the bullet
+  above says. The latch reopens with
+  `ControllerFailed` inside the reinitialization, once its HCRST has
+  completed and the post-reset capability check has passed and before the
+  steps that can still refuse: that HCRST has cleared the bits the latch
+  answered, so a later report is a new transition. A refusal before the
+  HCRST leaves the latch standing; a refusal after the clear on the recovery
+  path (`XhciRecoverController`) re-latches `ControllerFailed` and is charged
+  to the bounded recovery budget, and on the resume path counts a
+  `ResumeFailures` and returns the refusal to usbport. Left standing after a completed in-place
+  recovery, the latch silenced every later fatal: on the SMP guest on
+  2026-09-06 the first provoked HCE recovered and the next three were never
+  escalated (roadmap Phase 20, F19).
 - **An all-ones USBSTS is not a fatal-bit report.** It is a window that has
   stopped decoding, and HCE and HSE are two of the thirty-two bits it answers
   with. The same operand rule applies to the interrupt masks; here the cost of
@@ -333,9 +382,10 @@ code:
     measured directly by this clock: 354,364 ms against 6,461 polls
     (`run-13e.md`, Finding V). Every budget in the driver was therefore about
     an order of magnitude short. `XHCI_COMMAND_AGE_POLLS` came out at 2.3-5.1 s
-    instead of 32 s, at or under the 5 s watchdog it was sized to sit 12 s
-    behind, so the backstop that "cannot pre-empt a ladder that is working"
-    was pre-empting it every time. `CommandsTimedOut` read 0 in every dump
+    instead of 32 s, at or under `XHCI_COMMAND_TIMEOUT_MS` = 5,000 rather than
+    12 s clear of the ladder's 20 s legitimate worst case, so the backstop
+    that "cannot pre-empt a ladder that is working" was pre-empting it every
+    time. `CommandsTimedOut` read 0 in every dump
     ever taken from that machine, and the driver had been resetting
     controllers over commands that were merely slow.
   - Do not repeat the earlier figure of about 1 ms for the poll period. It
@@ -356,7 +406,7 @@ code:
     watchdog ladder, the port age clearing the reset deadline) are
     `XHCI_C_ASSERT`s rather than prose. The port age was the worst of the
     five.
-  - The two `*_POLLS` names left in `src/` are both inside `#ifdef
+  - Two of the three `*_POLLS` names left in `src/` are inside `#ifdef
     XHCI_FIX_*`: `XHCI_RH_SWEEP_SLOW_POLLS` (W15SLOW) and
     `XHCI_RH_GATE_STUCK_POLLS` (W7), so no shipping flavour carries either.
     They are Finding 3 bench candidates whose cadence is the measurement, and
@@ -364,6 +414,21 @@ code:
     shipping flavour has to convert first, and W7's is the same defect as the
     rest: twenty polls is ten seconds at 500 ms and 0.7-1.6 s at the E460's
     36-80 ms.
+  - The third is `XHCI_RECOVERY_DELIVERY_POLLS` (`src/xhci_hw.h`, used at
+    `xhciCheckController` in `src/xhci_dispatch.c`), and it is unconditional:
+    every shipping flavour carries it. It is a stated exception to this rule,
+    not an oversight. What it bounds is not a duration but a number of
+    delivery opportunities: an armed `UsbPortRequestAsyncCallback` that never
+    arrives is only observable from the poll that would have preceded it, so
+    "twenty polls with no delivery" is the quantity, and converting it to
+    milliseconds would measure something the driver does not care about.
+    The residual is real and is recorded rather than fixed: its comment still
+    justifies the value of twenty in wall-clock terms at the nominal 500 ms
+    period, which is the very inference Finding V destroyed, and at the E460's
+    36-80 ms the same twenty polls is 0.7-1.6 s rather than about ten seconds.
+    That leaves the lost-arming detector firing sooner on a fast poller, which
+    costs a re-request rather than a missed fault, so it is owed as a comment
+    correction and not as a code change.
   - A poll rate may only change the resolution of an answer, never its size.
     That is the property the poll-count form claimed and did not have.
 - Either flag set: stop submitting, fail pending work, request `UsbPortInvalidateController(RESET)`.
@@ -411,7 +476,7 @@ code:
 
 ## Transfer Buffers
 
-- Under Option A, `usbport.sys` hands the miniport already-mapped scatter/gather physical addresses for URB payloads - confirmed statically in both target binaries, through the NT DMA adapter, page-granular. Program those into TRBs directly. What the static pass does not settle is element ordering versus `SgOffset` and everything else about `SubmitTransfer`; order TRBs by `SgOffset` and instrument the list when the callback first becomes reachable in Phase 6 (`docs/usb-xhci-info/usbport-miniport-interface.md`, "What Phase 3 can and cannot prove about transfer mapping").
+- Under Option A, `usbport.sys` hands the miniport already-mapped scatter/gather physical addresses for URB payloads - confirmed statically in both target binaries, through the NT DMA adapter, page-granular. Program those into TRBs directly. What the static pass does not settle is element ordering versus `SgOffset` and everything else about `SubmitTransfer`; order TRBs by `SgOffset` regardless, which is what `src/xhci_xfer.c` does, so the runtime ordering never has to be assumed. Phase 6 instrumented it rather than trusting it: `src/xhci_probe.c` counts `ProbeSgDisordered`, `ProbeSgGapped`, `ProbeSgHighDwords` and `ProbeSgMapped` in every build, and a run that ends with all four at zero is the probe confirming the static record (`docs/usb-xhci-info/usbport-miniport-interface.md`, "What Phase 3 can and cannot prove about transfer mapping").
 - A single TRB's data buffer must not span a 64 KB physical boundary (xHCI spec 6.4.1 note). Split every SG fragment at 64 KB boundaries into chained TRBs - length <= 64 KB alone is not sufficient.
 - Common-buffer bounce buffers are the fallback policy only where the driver owns the mapping itself (Option B, or if the spike shows usbport passes virtual buffers): OUT transfers copy caller data into the bounce buffer before ringing the doorbell; IN transfers copy from the bounce buffer back to the caller after completion.
 - **Actual transferred length is `requested_length - residual_length` only for a single-TRB TD.** Without the qualifier it is wrong for every multi-TRB TD: "For multi-TRB TDs, if ED = `0`, the TRB Transfer Length only reflects the number of bytes transferred for the buffer associated with the Transfer TRB pointed to by the Transfer Event, not the total bytes transferred for the TD" (Table 6-39 note, p.441).
@@ -443,6 +508,10 @@ code:
 
 ## Device Addressing
 
+- An addressed EP0 open uses `xhciDevMayOpenEndpoint`, like non-default
+  endpoint opens. A failed record keeps `ADDRESS_VALID` for teardown; its
+  presence in the address map must not permit another binding or an
+  `EVALUATE_MPS` command. Host vector: `test_slot_failed_record_ep0_reopen`.
 - Never place a SET_ADDRESS setup packet on a transfer ring. The xHC blocks software-issued SET_ADDRESS and completes the TRB with a TRB Error (spec section 4.5.4.1); addresses are assigned via the Address Device command (spec section 4.6.5) - the xHC issues SET_ADDRESS on the bus itself.
 - `usbport.sys` sends SET_ADDRESS as an ordinary EP0 control transfer; the miniport must intercept it, issue Address Device (BSR = 0), and complete the transfer back as success.
 - Keep a usbport-address -> Slot ID map. Treat the address usbport assigns and the xHC-assigned one as unrelated: they may coincide (both allocators tend to count up from 1), so never infer the mapping from equality and never assert a mismatch. Every later endpoint open and transfer is keyed by usbport's address.
@@ -573,11 +642,18 @@ Why there is no MSI on either target. MSI is an interrupt delivered as a memory 
   miniport's own `ResetController` at DISPATCH inside a usbport lock, and
   usbport does nothing afterwards but release it (`docs/usb-xhci-info/usbport-miniport-abi.md`,
   "`UsbPortInvalidateController(RESET)`: real in the binaries"). This driver's
-  `ResetController` marks the controller terminally failed.
+  `ResetController` masks the interrupt enables, marks the controller failed
+  and raises a recovery request; it repairs nothing itself, which is why it is
+  containment.
 
   So the escalation converts a silently non-interrupting controller into a
-  visibly failed one and stops the command engine cleanly. The only path that
-  actually restores service is a stop/start, which no miniport can initiate.
+  visibly failed one and stops the command engine cleanly. Service is restored
+  from there by `XhciRecoverController`, which reinitializes in place on
+  usbport's health-poll callback, bounded by `XHCI_RECOVERY_MAX_ATTEMPTS`;
+  a controller that will not come back within that bound stays latched, and
+  that latched state is the terminal one, not this callback's. See "The
+  recovery request has an owner" above, the escalation ladder below, and
+  `docs/contributing/design/07-controller-recovery-in-place.md`.
 - **On a refusal, mask and unmask go opposite ways, and that is intended.**
   Masking applies whichever half it could still derive: refusing a derivable
   `INTE` clear leaves the enable up, and `ResetController` publishes
@@ -636,8 +712,10 @@ Why there is no MSI on either target. MSI is an interrupt delivered as a memory 
   prior run, not one interrupt's snapshot. Once dequeued, the object can be
   queued again even while its callback is executing. Under Option A,
   usbport's `MiniportInterruptsSpinLock` serializes miniport
-  `InterruptDpc` callbacks; confirm the NUSB binary retains that contract in
-  the Phase 3 spike.
+  `InterruptDpc` callbacks. The Phase 3 static pass confirmed the NUSB binary
+  retains that contract, and recorded the corollary that `FlushInterrupts`
+  takes no lock at all and so can run concurrently with `InterruptDpc` on SMP
+  (`docs/usb-xhci-info/usbport-miniport-abi.md`).
 - The DPC must drain until the Event Ring Cycle Bit indicates empty.
   During a long burst, publish progress by updating `ERDP` periodically with
   EHB left set (the project uses every 32 events); after observing empty,
@@ -761,7 +839,11 @@ Why there is no MSI on either target. MSI is an interrupt delivered as a memory 
   usbport lock, and every bounded wait in the init sequence stalls
   (`KeStallExecutionProcessor`) instead of sleeping; `XhciDelayMs`
   (`src/xhci_pci.c`) is the only fixed delay and takes the stall form there
-  too, 20 ms once per attempt. The flag is a contract: services documented
+  too: `xhciPowerPorts` reaches it twice per attempt through
+  `xhciSettlePortPower`, each call an optional 20 ms transition delay plus up
+  to 20 ms of confirmation polling in 5 ms steps, so that routine alone can
+  stall for 60 ms (design record 07 section 5). That bounds the power-up
+  step, not the whole recovery. The flag is a contract: services documented
   PASSIVE_LEVEL-only are skipped under it, not risked (see "Fatal Errors").
 
 ## MMIO Sanity
@@ -1034,34 +1116,34 @@ must therefore do.
     is what the slot and endpoint contexts and EP0's max packet size must be
     programmed from, because usbport now derives them on High Speed rules.
 
-    The interrupt interval is not recoverable and Phase 7 must not assume it
-    is. usbport branches on `DeviceSpeed` when it converts `bInterval` into
+    The interrupt interval is not recoverable. usbport branches on
+    `DeviceSpeed` when it converts `bInterval` into
     `EndpointProperties->Period`: a device it believes is High Speed goes
     through `USBPORT_NormalizeHsInterval`, which is `1 << min(bInterval-1, 5)`,
-    where the truthful Full/Low Speed path would have used `bInterval`
-    milliseconds directly. `USBPORT_ENDPOINT_PROPERTIES` carries no raw
+    measured in microframes; the truthful Full/Low Speed path buckets in
+    frames, to powers of two in 1..32 with Low Speed floored at 8.
+    `USBPORT_ENDPOINT_PROPERTIES` carries no raw
     `bInterval`, so the miniport receives only the result - and the result is
     lossy, because every true `bInterval >= 6` collapses onto the same clamped
-    32. The error is always in the slower direction, so it costs latency and
-    never over-commits bandwidth or violates the protocol, but a true 8 or 10 ms
-    HID endpoint arrives as 32 ms:
+    32 microframes. `XhciIntervalFromPeriod` uses usbport's believed speed
+    for that unit conversion; `XhciIntervalForSpeed` then uses the decoded
+    speed to floor Full/Low Speed interrupt service at 1 ms (Table 6-12).
 
-    | true `bInterval` (ms) | truthful `Period` | `Period` under the override |
-    |---|---|---|
-    | 1 | 1 | 1 |
-    | 2 | 2 | 2 |
-    | 3 | 2 | 4 |
-    | 4 | 4 | 8 |
-    | 8 | 8 | 32 |
-    | 10 | 8 | 32 |
-    | 16 | 16 | 32 |
-    | >= 32 | 32 | 32 |
+    | true `bInterval` (ms) | override `Period` (microframes) | programmed xHCI `Interval` | service interval |
+    |---|---|---|---|
+    | 1 | 1 | 3 | 1 ms |
+    | 2 | 2 | 3 | 1 ms |
+    | 3 | 4 | 3 | 1 ms |
+    | 4 | 8 | 3 | 1 ms |
+    | 5 | 16 | 4 | 2 ms |
+    | >= 6 | 32 | 5 | 4 ms |
 
-    Phase 7 therefore inherits a decision, not a fix: either accept the latency,
-    or have the miniport choose its own xHCI interval for Full and Low Speed
-    interrupt endpoints - which is legal, since `bInterval` bounds the maximum
-    service latency and polling sooner is permitted, but is a heuristic because
-    the true value is gone. Do not write code that claims to reconstruct it.
+    A true 8 or 10 ms interrupt endpoint therefore runs at 4 ms, not
+    32 ms. The override polls at the same or a shorter interval; changes
+    within a band cannot change the programmed interval. Periodic bandwidth
+    accounting under the believed speed remains unmeasured, so this is not
+    evidence that usbport's bandwidth budget is correct. Issue 06 section 4
+    records the measured bands. Do not reconstruct `bInterval` from `Period`.
   - **It is gated on a connection**, because the speed bits mean nothing without
     one and an empty port claiming High Speed would be a second untruth rather
     than the one that was argued for.
@@ -1281,12 +1363,17 @@ must therefore do.
   signalling with nothing to end it. Confirm each operation in its own target
   bit (`PP` for a power-off, `PED` for a disable - "there may be a delay in
   disabling or enabling a port", p.372) and retire nothing until it shows.
-- **There is one way to read a port, and everything uses it.** Reading PORTSC
-  obliges the reader to acknowledge the change bits it observed and fold them
-  into the shadow; a second reader that looks at one bit and discards the rest
-  drops connects on the floor. If a path needs a value from PORTSC, it goes
-  through the refresh - the same rule as "one way to write it", and broken the
-  same way: by a path added later for an unrelated reason.
+- **There is one way to acknowledge a port's change bits, and everything uses
+  it.** A reader that acknowledges PORTSC's RW1C change bits must fold them
+  into the shadow, so every path that acknowledges does so through
+  `xhciRhRefresh`; a second acknowledging reader that looks at one bit and
+  discards the rest drops connects on the floor. Raw single-field reads
+  through `XhciReadPortsc` that acknowledge nothing are permitted and exist
+  (the power-up confirmation in `xhci_init.c`, the reset, suspend and link
+  paths in `xhci_rh.c`), as are the composed writes `XhciWritePortsc` makes for
+  the feature callbacks; what they may not do is write a change bit. The rule
+  is about acknowledgement, not about reading: there are eleven
+  `XhciReadPortsc` call sites and they are all legitimate.
 - **The one sanctioned exception to that rule is an observation mode.**
   `xhciPassThru` reads the raw PORTSC array through `XhciReadPortsc` and does
   not acknowledge and does not fold. It is not a second reader added for an
@@ -1596,9 +1683,10 @@ must therefore do.
   decides to restart the xHC, then a Restore State operation is not required"
   (4.23.2, p.314). Win98's NUSB `usbport.sys` issues
   `SuspendController`/`ResumeController` pairs repeatedly, as idle behaviour
-  (measured in the Phase 3 spike; native Win2000 `usbport.sys` never idle-
-  suspended at all), and an idle pair that never reaches D3cold therefore costs
-  a halt and a restart - not a re-enumeration.
+  (measured in the Phase 3 spike; native Win2000 `usbport.sys` did not
+  idle-suspend in that observation window, which is an observation and not a
+  contract, roadmap Phase 20, F18), and an idle pair that never reaches D3cold
+  therefore costs a halt and a restart - not a re-enumeration.
 - **The suspend masks the interrupt enables itself, and must not wait to be
   asked.** `DisableInterrupts` was observed around the shutdown sequence, but
   nothing observed says the idle pairs are bracketed the same way. A suspend that

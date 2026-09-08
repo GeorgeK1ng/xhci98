@@ -106,8 +106,10 @@ Controller").
    (the capability this driver wrote to is not where it wrote) and
    `XHCI_CAPS_TOPOLOGY_CHANGED` (the topology it is about to act on is not the
    one it validated). The third driver-raised code in that space,
-   `XHCI_CAPS_NO_MANAGED_PORTS`, is the preflight's (step 12 below), where the
-   port map is `XHCI_INIT_STEP_PORT_MAP` = 6.
+   `XHCI_CAPS_NO_MANAGED_PORTS`, is normally the preflight's (step 12 below),
+   where the port map is `XHCI_INIT_STEP_PORT_MAP` = 6; it is raised on either
+   pass, so a re-parse that finds no managed port reports it at
+   `XHCI_INIT_STEP_PORT_MAP_RECHECK` = 11.
 
    Compare the two field for field, and keep both maps in the miniport
    extension so exactness costs no stack. A digest is the wrong tool here: this
@@ -284,30 +286,16 @@ USB 3.x capable devices on USB 2.0 companion ports: if the USB 3.x logical compa
 
 ## What SuperSpeed Support Would Require
 
-SuperSpeed is not an extension of the USB 2.0 miniport path. The reused
-Win2000-era `usbport.sys` has no SuperSpeed speed reporting, bandwidth model,
-root-hub semantics, or USB 3.x hub support. A SuperSpeed implementation would
-first have to replace Option A with the Option B monolithic HCD described in
-`docs/usb-xhci-info/win98-wdm.md`, taking ownership of the root-hub PDO,
-`IOCTL_INTERNAL_USB_*`, URB parsing, enumeration, and scheduling.
+General SuperSpeed support is not an extension of the USB 2.0 miniport path.
+The reused Win2000-era `usbport.sys` has no SuperSpeed speed reporting,
+bandwidth model, root-hub semantics, or USB 3.x hub support, and a SuperSpeed
+implementation would first have to replace Option A with the Option B
+monolithic HCD before the xHCI layer gained the link, descriptor, burst, hub
+and bandwidth paths. What that would take is recorded in
+`docs/future-plans/superspeed-hcd-reimplementation.md`; the narrower case of
+a bulk device on a root port is `docs/future-plans/superspeed-storage-behind-a-switch.md`.
 
-Only after that USB 2.0 replacement worked would the xHCI layer gain the
-SuperSpeed-specific paths:
-
-- Power USB 3.x ports and implement link-state transitions, U0/U1/U2/U3,
-  warm reset, link training, and compliance-mode recovery.
-- Parse BOS, SuperSpeed Device Capability, and SuperSpeed Endpoint Companion
-  descriptors; use the 512-byte EP0 maximum packet size.
-- Program Max Burst, Mult, and Max ESIT Payload, account for burst transfers,
-  and add Stream Context Arrays if UAS bulk streams are supported.
-- Implement USB 3.x hub descriptors and port state. SuperSpeed hubs have no
-  transaction translators, but still require Route Strings; the NT5 hub
-  drivers cannot provide this path, so a USB 3.x-aware hub driver would also
-  be required unless support stopped at root-port devices.
-- Add a SuperSpeed bandwidth model and validate link training, warm reset,
-  U-state transitions, hubs, storage, Ethernet, and audio on real controllers.
-
-This is a separate driver-stack project with little practical benefit on the
+It is a separate driver-stack project with little practical benefit on the
 target operating systems; High-Speed already covers the intended HID, storage,
 Ethernet, and audio workloads. A controller exposing only USB 3.x protocol
 ports is therefore refused at start (`XHCI_CAPS_NO_MANAGED_PORTS`) rather than
@@ -649,7 +637,7 @@ normative for what is reported, this section for what is decoded.
 
 Map xHCI Transfer Event completion codes (spec section 6.4.5; the codes this driver handles are tabled in `docs/usb-xhci-info/xhci-data-structures.md` "Completion Codes") to `USBD_STATUS`. Implemented by `XhciXferCodeInfo` (`src/xhci_xfer.c`), pinned by `test/test_xfer.c`.
 
-The vocabulary is the Windows 2000 DDK's `usbdi.h`. `USBD_STATUS_DATA_BUFFER_ERROR`, `USBD_STATUS_BABBLE_DETECTED` and `USBD_STATUS_XACT_ERROR`, the three names ReactOS's `usbehci` returns, do not exist in `C:\NTDDK\inc\usbdi.h` (checked, not recalled); they are later WDK additions. That header is the one this driver builds against and the one both targets' USB stacks were built from, so its set is the ceiling. The era-appropriate equivalents are the ones ReactOS's uhci miniport uses, which is the closest precedent available for a miniport shipping against this header.
+The vocabulary is the Windows 2000 DDK's `usbdi.h`. `USBD_STATUS_DATA_BUFFER_ERROR`, `USBD_STATUS_BABBLE_DETECTED` and `USBD_STATUS_XACT_ERROR`, the three names ReactOS's `usbehci` returns, do not exist in the Windows 2000 DDK's `inc\usbdi.h`, which this repository unpacks to `tools\ntddk\` (checked, not recalled); they are later WDK additions. That header is the one this driver builds against and the one both targets' USB stacks were built from, so its set is the ceiling. The era-appropriate equivalents are the ones ReactOS's uhci miniport uses, which is the closest precedent available for a miniport shipping against this header.
 
 `USBD_STATUS_DEVICE_GONE` is a fourth name in the same trap. It was proposed for a transfer whose device record is already gone and declined because that name is also absent from the Windows 2000 DDK's `usbdi.h`. usbport's own code has the value internally (`usbport-miniport-abi.md` section 4), but the miniport completes such a transfer with `USBD_STATUS_CANCELED`, the status it already answers for a `GONE` record.
 

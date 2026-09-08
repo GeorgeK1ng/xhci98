@@ -41,17 +41,7 @@ $packager = Join-Path $PSScriptRoot "make-package.ps1"
 $releaser = Join-Path $PSScriptRoot "make-release.ps1"
 $prodInf = Join-Path $repo "src\xhci98.inf"
 
-$script:failures = @()
-$script:checks = 0
-
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    $script:checks++
-    if (-not $Condition) {
-        $script:failures += $Message
-        Write-Host "FAIL: $Message" -ForegroundColor Red
-    }
-}
+. (Join-Path (Split-Path -Parent $PSScriptRoot) "test-harness.ps1")
 
 function Get-StandInSha {
     param([byte[]]$Bytes)
@@ -285,20 +275,38 @@ try {
     # the padding (then it measures nothing) and a switch that stages the
     # ordinary date anyway (then it measures nothing either, and says it did).
     #
+    #
+    # **Against a date this test owns, not against the live INF's.** The
+    # packager refuses the switch when the source date is already unpadded,
+    # because then there is nothing to vary - and the shipping date moves with
+    # every release. A cut on, say, 15 October 2026 has no leading zero to
+    # strip in either field, so the packager would throw and this case, which
+    # asserts exit 0, would fail the BUILD from the first cut carrying it. The
+    # experiment is about the padding, so the date it runs on has to be one
+    # with padding, and that is this file's business rather than the release
+    # calendar's. The 2026-09-07 audit's H12.
+    #
     Write-Step "the unpadded-date experiment changes the date and nothing else"
+    $paddedInf = New-Inf -Name "padded-date" -Mutate {
+        param($t) $t -replace '(?m)^DriverVer=\d{1,2}/\d{1,2}/(\d{4}),', 'DriverVer=01/02/$1,'
+    }
+    Assert-True ([System.IO.File]::ReadAllText($paddedInf) -match '(?m)^DriverVer=01/02/\d{4},') `
+        "the padded-date INF this case derives was not produced; fix the pattern, not the packager."
     $dfOut = Join-Path $script:work "pkg-datefmt"
-    $r = Invoke-Packager @("-InfPath", $plainInf, "-DriverPath", $driver,
+    $r = Invoke-Packager @("-InfPath", $paddedInf, "-DriverPath", $driver,
         "-OutDir", $dfOut, "-UnpaddedDriverVerExperiment")
     Assert-True ($r.ExitCode -eq 0) ("the unpadded-date package was rejected:`n" + $r.Output)
     Assert-True ($r.Output -match "UNPADDED-DriverVer EXPERIMENT") `
         ("expected a banner naming the experiment. Output:`n" + $r.Output)
     if (Test-Path -LiteralPath (Join-Path $dfOut "xhci98.inf")) {
         $stagedText = [System.IO.File]::ReadAllText((Join-Path $dfOut "xhci98.inf"))
-        $prodText = [System.IO.File]::ReadAllText($plainInf)
+        $prodText = [System.IO.File]::ReadAllText($paddedInf)
         Assert-True ($stagedText -match '(?m)^DriverVer=\d{1,2}/\d{1,2}/\d{4},') `
             "the staged INF has no DriverVer date at all."
         Assert-True ($stagedText -notmatch '(?m)^DriverVer=0\d/') `
             "the staged INF's DriverVer month is still zero-padded, so nothing was varied."
+        Assert-True ($stagedText -match '(?m)^DriverVer=1/2/\d{4},') `
+            "the staged INF's date is not the unpadded form of the one this case supplied."
         # The single-difference property, checked rather than asserted: every
         # other line must be byte-identical to the INF it was derived from.
         $a = $prodText -split "`r`n"
@@ -510,8 +518,111 @@ try {
         "a stand-in driver was packaged with the binary gates enabled."
     Assert-True ($r.Output -match "host test suite|import-compatibility gate") `
         ("expected the refusal to name the gate that ran. Output:`n" + $r.Output)
+    # **"Gated" and "inconclusive" are different readings** (audit H18). Smart
+    # App Control blocking a freshly linked unsigned exe makes the host suite
+    # produce no result line, and the packager refuses on that too - with a
+    # message that says to run it again. That refusal would satisfy the two
+    # assertions above while proving nothing about whether the gates ran, so
+    # the one message that must NOT be what fired is named here.
+    Assert-True ($r.Output -notmatch "produced no result line") `
+        ("the host suite did not run at all (Smart App Control), so this case " +
+         "proved nothing about whether the gates are enabled by default. " +
+         "Run it again. Output:`n" + $r.Output)
     Assert-True (-not (Test-Path -LiteralPath $gatedOut)) `
         "the output directory was created for a driver that failed a binary gate."
+
+    # --- the output path refusals (audit H18) -------------------------------
+    #
+    # This script replaces its output directory wholesale, so where it is
+    # pointed is a data-loss question rather than a tidiness one. The packager
+    # refuses a volume root, the repository root, a path naming a file, and
+    # anything under releases\ - and none of those four refusals had a test.
+    # The volume-root one in particular is reached from two places in
+    # make-package.ps1 (an early check added because the later one was
+    # unreachable for `E:\`), and neither was ever produced.
+    Write-Step "the output path refusals"
+
+    $rootOut = [System.IO.Path]::GetPathRoot($script:work)
+    $r = Invoke-Packager @("-InfPath", $plainInf, "-DriverPath", $driver, "-OutDir", $rootOut)
+    Assert-True ($r.ExitCode -ne 0) "the packager accepted a volume root as -OutDir."
+    Assert-True ($r.Output -match "volume or repository root") `
+        ("expected the volume-root refusal. Output:`n" + $r.Output)
+
+    $r = Invoke-Packager @("-InfPath", $plainInf, "-DriverPath", $driver, "-OutDir", $repo)
+    Assert-True ($r.ExitCode -ne 0) "the packager accepted the repository root as -OutDir."
+    Assert-True ($r.Output -match "volume or repository root") `
+        ("expected the repository-root refusal. Output:`n" + $r.Output)
+
+    # A path that exists and is a FILE. The refusal has to name that, rather
+    # than failing later in a directory operation with no explanation.
+    $fileOut = Join-Path $script:work "not-a-directory"
+    Set-Content -LiteralPath $fileOut -Value "occupied" -Encoding ASCII
+    $r = Invoke-Packager @("-InfPath", $plainInf, "-DriverPath", $driver, "-OutDir", $fileOut)
+    Assert-True ($r.ExitCode -ne 0) "the packager accepted a file as -OutDir."
+    Assert-True ($r.Output -match "is a file, not a directory") `
+        ("expected the not-a-directory refusal. Output:`n" + $r.Output)
+    Assert-True ((Get-Content -LiteralPath $fileOut -Raw).Trim() -eq "occupied") `
+        "the packager overwrote the file it was pointed at."
+
+    # --- a foreign file in a SUBDIRECTORY (audit H18) -----------------------
+    #
+    # The foreign-file check is recursive, and both existing cases put their
+    # bystander at the root - so the recursion was untested and a check written
+    # against the top level only would have passed them both. A transfer
+    # directory with a subdirectory of notes in it is the realistic shape.
+    Write-Step "a foreign file below the output root is found too"
+    $deepOut = Join-Path $script:work "pkg-foreign-deep"
+    Ensure-Directory (Join-Path $deepOut "notes")
+    $deepBystander = Join-Path $deepOut "notes\keep-me.txt"
+    Set-Content -LiteralPath $deepBystander -Value "not ours" -Encoding ASCII
+    $r = Invoke-Packager @("-InfPath", $plainInf, "-DriverPath", $driver, "-OutDir", $deepOut)
+    Assert-True ($r.ExitCode -ne 0) `
+        "the packager replaced a directory holding a foreign file one level down."
+    Assert-True ($r.Output -match "did not stage") `
+        ("expected the foreign-file refusal. Output:`n" + $r.Output)
+    Assert-True (Test-Path -LiteralPath $deepBystander) `
+        "the foreign file below the output root was deleted."
+
+    # --- the missing-version-resource refusal (audit H18) -------------------
+    #
+    # NOT TESTED, and recorded here rather than left as a silent gap. That
+    # refusal fires only with the binary gates ON, and with them on the host
+    # test suite and the import gate run FIRST and refuse this harness's
+    # stand-in driver - which is a text file - before the version resource is
+    # ever looked at. Producing it needs a real linked driver built without
+    # src\xhci98.rc, which is a build this repository has not been able to make
+    # since task 8-A.4 put the .rc in src\sources. The negative control for the
+    # rule is what exists instead: the -SkipBinaryGates warning path is driven
+    # by every other case in this file, and the version COMPARISON is
+    # deliberately not gated on the switch, so a stand-in that does carry a
+    # version is still checked against the INF.
+
+    # --- the two degenerate unpadded-date inputs (audit H18) ----------------
+    #
+    # make-package.ps1 refuses both, and neither refusal had a test: a source
+    # whose date is already unpadded (the derived package would be
+    # byte-identical, so it is not an experiment) and a source with more than
+    # one DriverVer to rewrite (which of them varies is then unstated).
+    Write-Step "the unpadded-date experiment refuses its two degenerate inputs"
+    $alreadyUnpadded = New-Inf -Name "already-unpadded" -Mutate {
+        param($t) $t -replace '(?m)^DriverVer=\d{1,2}/\d{1,2}/(\d{4}),', 'DriverVer=1/2/$1,'
+    }
+    $r = Invoke-Packager @("-InfPath", $alreadyUnpadded, "-DriverPath", $driver,
+        "-OutDir", (Join-Path $script:work "pkg-already-unpadded"),
+        "-UnpaddedDriverVerExperiment")
+    Assert-True ($r.ExitCode -ne 0) `
+        "the experiment was accepted on a source whose date is already unpadded."
+    Assert-True ($r.Output -match "already unpadded") `
+        ("expected the already-unpadded refusal. Output:`n" + $r.Output)
+
+    $twoDriverVers = New-Inf -Name "two-driverver" -Mutate {
+        param($t) $t -replace '(?m)^(DriverVer=\d{1,2}/\d{1,2}/\d{4},.*)$', "`$1`r`n`$1"
+    }
+    $r = Invoke-Packager @("-InfPath", $twoDriverVers, "-DriverPath", $driver,
+        "-OutDir", (Join-Path $script:work "pkg-two-driverver"),
+        "-UnpaddedDriverVerExperiment")
+    Assert-True ($r.ExitCode -ne 0) `
+        "the experiment was accepted on a source carrying two DriverVer lines."
 
     # --- a [SourceDisksFiles] subdirectory must be honoured -----------------
     #
@@ -714,25 +825,57 @@ try {
         Assert-True ($touched.Count -eq 0) `
             ("-UploadSetOnly rewrote " + $touched.Count + " file(s) of the published release, which it must never write to.")
 
-        # --- and a package that is not the one the release was cut from -----
+        # --- assembled from the tracked directory alone ---------------------
         #
-        # The gates do not re-run in this mode, so the identity check is all
-        # that stands between the published driver and some other build's usbd
-        # files - the swap nothing detects on the target, where both are called
-        # usbd.sys.
-        Write-Step "an upload set is refused around a package the release did not come from"
-        $goodDebugSys = [System.IO.File]::ReadAllBytes((Join-Path $pkgRoot "pkg-debug\xhci98.sys"))
-        [System.IO.File]::WriteAllBytes((Join-Path $pkgRoot "pkg-debug\xhci98.sys"),
-            [System.Text.Encoding]::ASCII.GetBytes("a different build entirely"))
-        $r = Invoke-Releaser $relArgs
-        Assert-True ($r.ExitCode -ne 0) `
-            "an upload set was assembled from a package whose driver is not the published one."
-        Assert-True ($r.Output -match "not the file published") `
-            ("expected the refusal to say the package is not the published build. Output:`n" + $r.Output)
-        # **Put it back.** Review finding 6: every case below would
-        # otherwise exit nonzero on this same mismatch, so a regression in the
-        # guard each one is actually about would still leave the test green.
-        [System.IO.File]::WriteAllBytes((Join-Path $pkgRoot "pkg-debug\xhci98.sys"), $goodDebugSys)
+        # roadmap Phase 20, F15. This mode used to require the gated
+        # out\pkg-<flavour>\ directories to exist and to hash-match the
+        # published binaries, a dependency left over from when the media
+        # carried Microsoft files the package supplied. Since 1.0.0.1 nothing
+        # from the package enters the asset, so a fresh clone with no out\ at
+        # all - the machine a lost asset is most likely to be rebuilt on - has
+        # to be able to rebuild it, and the run must not create the package
+        # root it was told does not exist.
+        Write-Step "the upload set is rebuilt from a clone with no out\ at all"
+        $noOut = Join-Path $script:work "no-such-out"
+        Remove-Item -LiteralPath $uploadDir -Recurse -Force
+        Remove-Item -LiteralPath $uploadZip -Force
+        $r = Invoke-Releaser @("-UploadSetOnly", "-Version", $relVersion, "-ReleasesDir", $relRoot,
+                               "-PackageRoot", $noOut, "-UploadDir", $upRoot)
+        Assert-True ($r.ExitCode -eq 0) ("the upload set was not assembled without a package root:`n" + $r.Output)
+        foreach ($fl in @("release", "debug")) {
+            foreach ($name in @("xhci98.sys", "xhci98.inf")) {
+                Assert-True (Test-Path -LiteralPath (Join-Path $uploadDir "$fl\$name")) `
+                    "'$name' is missing from the upload set's $fl\ directory when assembled without a package root."
+            }
+        }
+        Assert-True (Test-Path -LiteralPath $uploadZip) "no upload archive was written when assembled without a package root."
+        Assert-True (-not (Test-Path -LiteralPath $noOut)) "the run created the package root it was told did not exist."
+
+        # --- and only the current cut's asset -------------------------------
+        #
+        # The INF gate this mode runs encodes the current release's rules, and
+        # an older cut fails the rules added since (the 1.0.0.1 INF fails six,
+        # measured read-only on 2026-09-05). An older -Version is refused with
+        # that reason before anything is assembled, rather than failing the
+        # gate with a message about the media.
+        Write-Step "-UploadSetOnly refuses a version other than the current cut, and says why"
+        $olderVersion = "0.9.9.9"
+        $olderRoot = Join-Path $relRoot $olderVersion
+        foreach ($fl in @("release", "debug")) {
+            Ensure-Directory (Join-Path $olderRoot $fl)
+            Copy-Item -LiteralPath (Join-Path $pubRoot "$fl\xhci98.sys") -Destination (Join-Path $olderRoot "$fl\xhci98.sys") -Force
+            Copy-Item -LiteralPath $plainInf -Destination (Join-Path $olderRoot "$fl\xhci98.inf") -Force
+        }
+        Set-Content -LiteralPath (Join-Path $olderRoot "readme.txt") -Encoding ASCII -Value "stand-in older cut"
+        $r = Invoke-Releaser @("-UploadSetOnly", "-Version", $olderVersion, "-ReleasesDir", $relRoot,
+                               "-PackageRoot", $noOut, "-UploadDir", $upRoot)
+        Assert-True ($r.ExitCode -ne 0) "-UploadSetOnly assembled an asset for a version that is not the current cut."
+        Assert-True ($r.Output -match "current cut only") `
+            ("expected the refusal to say this mode rebuilds the current cut only. Output:`n" + $r.Output)
+        Assert-True ($r.Output -match "check out the commit that cut it") `
+            ("expected the refusal to name the way to rebuild an older cut. Output:`n" + $r.Output)
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $upRoot ("upload-" + $olderVersion)))) `
+            "the refused older-version run assembled an upload directory anyway."
 
         # --- the switches that contradict -UploadSetOnly --------------------
         Write-Step "-UploadSetOnly refuses the switches that contradict it"
@@ -769,8 +912,12 @@ try {
         # absolute FullName, so a relative root cut mid-path - and every check
         # downstream re-derived it the same wrong way and agreed. The run
         # exited 0 with files at paths like
-        # release\Data\Local\Temp\...\usbd98.sys. It has to resolve against the
-        # caller's location and produce the same asset as the absolute form.
+        # release\Data\Local\Temp\...\usbd98.sys. -UploadSetOnly no longer
+        # reads the package at all (F15, above), so what this case still holds
+        # is narrower: a relative -PackageRoot is resolved against the caller's
+        # location by Resolve-DirectoryArgument, as every directory argument is,
+        # and the asset it produces is the same complete one as the absolute
+        # form.
         #
         Write-Step "a relative -PackageRoot resolves against the caller's location"
         $relPkgParent = Split-Path -Parent $pkgRoot
@@ -815,32 +962,40 @@ try {
         # in the package that was not one of this project's own two files, and
         # check-inf.ps1 -PackageDir does not object to a file nobody declared -
         # it checks the declared ones are present. So anything left in
-        # out\pkg-<flavour>\ went up in the release asset. That download is the
-        # one channel through which this project distributes files that are not
-        # its own, and it is exactly two of them.
+        # out\pkg-<flavour>\ went up in the release asset.
         #
-        Write-Step "a package file the INF does not name is refused, not published"
-        $stray = Join-Path $pkgRoot "pkg-release\notes.txt"
-        Set-Content -LiteralPath $stray -Encoding ASCII -Value "left behind by hand"
-        $r = Invoke-Releaser $relArgs
-        Assert-True ($r.ExitCode -ne 0) `
-            "a file the INF does not name was accepted into the upload set."
-        Assert-True ($r.Output -match "notes\.txt") `
-            ("expected the refusal to name the undeclared file. Output:`n" + $r.Output)
-        Remove-Item -LiteralPath $stray -Force
-
-        # And the other half of the same rule: a declared file missing from the
-        # package is refused too, rather than producing a directory that quietly
-        # lacks it.
-        Write-Step "a package missing a file the INF names is refused"
-        $heldBack = Join-Path $pkgRoot "pkg-release\xhci98.inf"
-        $heldBackBytes = [System.IO.File]::ReadAllBytes($heldBack)
-        Remove-Item -LiteralPath $heldBack -Force
-        $r = Invoke-Releaser $relArgs
-        Assert-True ($r.ExitCode -ne 0) "a package missing xhci98.inf assembled an upload set."
-        Assert-True ($r.Output -match "xhci98\.inf") `
-            ("expected the refusal to name the missing file. Output:`n" + $r.Output)
-        [System.IO.File]::WriteAllBytes($heldBack, $heldBackBytes)
+        # **No longer drivable from here.** The two cases that held this rule
+        # ran -UploadSetOnly against a package with a stray file and against one
+        # missing a declared file; since the Phase 20 fix pass that mode does
+        # not read the package (F15), so both would exit 0 for the wrong reason.
+        # The rule itself stands in Assert-PackageMatchesDeclaredMedia, which the
+        # ordinary cut still applies to each package before the publish swap,
+        # and that path needs a build this suite does not have - the same limit
+        # the structural check below states for the media-root refusal. What
+        # replaced the coverage is narrower and is asserted in the F15 case
+        # above: the asset holds exactly the published tree, and nothing under
+        # the package root is read or created.
+        #
+        # -UploadSetOnly does still refuse an INF that names a media file beyond
+        # this project's two, since the tracked directory has no source for it.
+        # The mutation adds a third [SourceDisksFiles] entry; the current gate
+        # would refuse the file's presence on the media anyway, so the refusal
+        # this case pins is the one that fires with no package at all.
+        Write-Step "-UploadSetOnly refuses an INF naming a media file the tracked directory cannot supply"
+        $thirdInf = New-Inf -Name "third" -Mutate {
+            param($t) $t.Replace("xhci98.inf=1", "xhci98.inf=1`r`nextra.bin=1")
+        }
+        foreach ($fl in @("release", "debug")) {
+            Copy-Item -LiteralPath $thirdInf -Destination (Join-Path $pubRoot "$fl\xhci98.inf") -Force
+        }
+        $r = Invoke-Releaser @("-UploadSetOnly", "-Version", $relVersion, "-ReleasesDir", $relRoot,
+                               "-PackageRoot", $noOut, "-UploadDir", $upRoot)
+        Assert-True ($r.ExitCode -ne 0) "an INF naming a third media file assembled an upload set from the tracked directory alone."
+        Assert-True ($r.Output -match "extra\.bin") `
+            ("expected the refusal to name the file the tracked directory cannot supply. Output:`n" + $r.Output)
+        foreach ($fl in @("release", "debug")) {
+            Copy-Item -LiteralPath $plainInf -Destination (Join-Path $pubRoot "$fl\xhci98.inf") -Force
+        }
 
         # --- what is NOT covered here, and why -------------------------------
         #
@@ -895,14 +1050,31 @@ try {
         # the guard could have been deleted and the case stayed green. Both
         # containment directions are driven, and both assert the diagnostic.
         #
-        Write-Step "-UploadDir inside or around the published release is refused"
+        Write-Step "-UploadDir inside or around the published release, or anywhere under releases\, is refused"
         $containment = @(
             # The upload set would land inside the version directory.
             @{ Why = "inside"; UploadDir = $pubRoot },
             # ...and the reverse: an upload root that would *contain* the
             # published tree, which is the branch nothing exercised.
             @{ Why = "around"; UploadDir = (Split-Path -Parent $relRoot);
-               Releases = (Join-Path (Join-Path $script:work "wrap") ("upload-" + $relVersion + "\releases")) }
+               Releases = (Join-Path (Join-Path $script:work "wrap") ("upload-" + $relVersion + "\releases")) },
+            # roadmap Phase 20, F4: the guard compared with the version being
+            # cut alone, so an -UploadDir under an OLDER cut was accepted and
+            # would have written `upload-<v>\` and the zip into a written-once
+            # directory .gitignore does not cover. The older cut staged for the
+            # F15 case above is the destination here.
+            @{ Why = "inside an older cut"; UploadDir = $olderRoot },
+            # ...and the releases root itself, whose `upload-<v>\` and zip
+            # would be siblings of every cut.
+            @{ Why = "at the releases root"; UploadDir = $relRoot },
+            # The repository's OWN releases\ while -ReleasesDir points at the
+            # stand-in tree: the override moves the cut, not the protection
+            # (Phase 20 review, finding 5). The destination is a probe name
+            # under the canonical root that does not exist; the guard must
+            # refuse before anything is written, and the case removes the
+            # probe if a broken guard ever creates it.
+            @{ Why = "under the repository's own releases directory with -ReleasesDir overridden";
+               UploadDir = (Join-Path (Join-Path $repo "releases") (".selftest-probe-" + [System.IO.Path]::GetRandomFileName())) }
         )
         # The "around" case needs the release to sit under what would become
         # the upload root, so it is staged as a copy rather than by moving the
@@ -914,7 +1086,10 @@ try {
 
         foreach ($c in $containment) {
             $useReleases = if ($c.Why -eq "around") { $wrapReleases } else { $relRoot }
-            $useRoot = if ($c.Why -eq "around") { Join-Path $wrapReleases $relVersion } else { $pubRoot }
+            # What must be untouched: the whole releases tree, not only the
+            # version being assembled - the older cut is what F4 would have
+            # written into.
+            $useRoot = if ($c.Why -eq "around") { Join-Path $wrapReleases $relVersion } else { $relRoot }
             $before = @{}
             foreach ($f in (Get-ChildItem -LiteralPath $useRoot -File -Recurse)) {
                 $before[$f.FullName] = (Get-FileHash -LiteralPath $f.FullName).Hash
@@ -946,6 +1121,13 @@ try {
             # leave.
             Assert-True ((@(Get-ChildItem -LiteralPath $useRoot -Directory -Recurse).Count) -eq $beforeDirs) `
                 "the refused $($c.Why) run left a directory behind inside the published release."
+            if ($c.UploadDir.StartsWith((Join-Path $repo "releases"), [System.StringComparison]::OrdinalIgnoreCase)) {
+                Assert-True (-not (Test-Path -LiteralPath $c.UploadDir)) `
+                    "the refused $($c.Why) run created its destination under the repository's own releases directory."
+                if (Test-Path -LiteralPath $c.UploadDir) {
+                    Remove-Item -LiteralPath $c.UploadDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
         }
     }
 
@@ -998,7 +1180,7 @@ try {
     $releaserText = [System.IO.File]::ReadAllText($releaser)
     $marks = @(
         @{ Name = "the media-root assertion";  Find = 'Assert-PublishableAtMediaRoot -Layout $declaredLayout' },
-        @{ Name = "the containment assertion"; Find = 'Assert-UploadSetOutsideRelease -UploadRoot (Join-Path $UploadDir' },
+        @{ Name = "the containment assertion"; Find = 'Assert-UploadSetOutsideRelease -UploadRoot $early.Root' },
         @{ Name = "the make-package call";     Find = '& powershell.exe @pkgArgs' },
         @{ Name = "the declared-media check";  Find = 'Assert-PackageMatchesDeclaredMedia -PkgDir $pkgDir -Expected $declaredExpected' },
         @{ Name = "the publish swap";          Find = 'Move-Item -LiteralPath $destRoot -Destination $finalRoot' },
@@ -1019,6 +1201,153 @@ try {
                 ("$($marks[$i - 1].Name) must come before $($marks[$i].Name) in make-release.ps1: a refusal that fires after the publish leaves a written-once release with no asset.")
         }
     }
+
+    # --- the readme template may not carry the two claims 1.0.1.0 shipped ----
+    #
+    # roadmap Phase 20, F7. The rendered readme.txt is byte-identical to the
+    # template apart from its placeholders, so the template is what this reads.
+    # "WINDOWS 98 ONLY" described DisableSelectiveSuspend as a Windows 98
+    # setting after 1.0.1.0 had made the NT path write it too, and the shipped
+    # file contradicted itself; "redistributes nothing of Microsoft's" is the
+    # sentence AGENTS.md forbids, because XHCISNAP.EXE statically links the
+    # MSVC 6.0 runtime the release's own NOTICE.TXT attributes to Microsoft.
+    # The defensible form is "No Microsoft file is in this download".
+    Write-Step "the readme template carries neither of the two forbidden claims"
+    foreach ($forbidden in @("WINDOWS 98 ONLY", "redistributes nothing")) {
+        Assert-True ($releaserText -notmatch [regex]::Escape($forbidden)) `
+            ("make-release.ps1 still says '" + $forbidden + "'; the readme it renders would repeat a claim 1.0.1.0 made false or AGENTS.md forbids.")
+    }
+    Assert-True ($releaserText -match "No Microsoft file is in this download") `
+        "make-release.ps1 lost the one defensible form of the no-Microsoft-file statement."
+
+    # And the third claim, which the 2026-09-07 audit's D9 fix put IN while
+    # removing the other two: an introduction that named Windows 98 SE and
+    # Windows 2000 SP4 together as "validated on, including on real hardware".
+    # AGENTS.md, "Project Purpose", is explicit that Windows 2000 has never
+    # run on real hardware in this project and that every Windows 2000
+    # observation here is a virtual-machine one. A download that says
+    # otherwise is the one file a user reads before trusting the driver with
+    # a machine.
+    #
+    # Asserted as a pair - the wrong sentence absent, the right one present -
+    # because the absence alone is satisfied by deleting the paragraph, and
+    # the qualification is the point.
+    Assert-True ($releaserText -notmatch "validated on, including on real hardware") `
+        "make-release.ps1 tells the reader Windows 2000 SP4 is validated on real hardware; AGENTS.md says every Windows 2000 observation in this project is a virtual-machine one."
+    Assert-True ($releaserText -match "Only Windows 98 SE has been validated on") `
+        "make-release.ps1 no longer says which target the real-hardware validation belongs to, so the reader cannot tell that Windows 2000 SP4's is virtual-machine only."
+
+    # --- the source stamp: what it can and cannot vouch for -----------------
+    #
+    # Three rounds of review went into this one gate and each defect was found
+    # by reading rather than by a failing test, so here is the test. The
+    # `.sys` is a stand-in - `source-stamp.ps1` hashes it as bytes and never
+    # parses it - and the source half is hashed from the real `src\`, which is
+    # what makes case 4 a genuine mismatch rather than a fabricated one.
+    Write-Step "the source stamp: sources, binary identity, and the legacy format"
+    $stampScript = Join-Path $repo "scripts\source-stamp.ps1"
+    $stampWork = Join-Path $script:work "stamp"
+    New-Item -ItemType Directory -Path $stampWork | Out-Null
+    $stampSys = Join-Path $stampWork "xhci98.sys"
+    $stampFile = Join-Path $stampWork "xhci98.srcstamp"
+
+    # ErrorActionPreference is relaxed across the call, for the reason
+    # make-release.ps1 records at its make-package.ps1 invocation (audit H17):
+    # in Windows PowerShell 5.1 a native command's stderr line becomes an
+    # ErrorRecord, so under "Stop" the refusal this helper exists to MEASURE
+    # aborts the suite instead of being returned as an exit code. It bites
+    # only when the child's stderr is redirected, which is why the first cut
+    # of these tests passed until one of them made the script throw.
+    function Invoke-Stamp {
+        param([string]$Mode, [string]$Dir)
+        $saved = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $null = & powershell -NoProfile -ExecutionPolicy Bypass -File $stampScript $Mode $Dir 2>&1
+        } finally {
+            $ErrorActionPreference = $saved
+        }
+        return $LASTEXITCODE
+    }
+
+    [System.IO.File]::WriteAllBytes($stampSys, [byte[]](1, 2, 3, 4))
+    Assert-True ((Invoke-Stamp "-Write" $stampWork) -eq 0) `
+        "source-stamp.ps1 -Write failed on a directory holding an xhci98.sys."
+    # @(...) for the same strict-mode reason the script itself needed it: a
+    # single matching line comes back as a String, and a String has no .Count.
+    Assert-True (@(Get-Content -LiteralPath $stampFile | Where-Object { $_ -cmatch '^BINARY [0-9A-F]{64} xhci98\.sys$' }).Count -eq 1) `
+        "the stamp carries no BINARY line, so it cannot say which .sys it was written for (audit H13, round 3)."
+    Assert-True ((Invoke-Stamp "-Check" $stampWork) -eq 0) `
+        "a stamp checked against the tree and binary it was just written from must pass."
+
+    # The hole the first two H13 fixes both walked around: same sources, a
+    # different binary restored beside them. make-release.ps1's own
+    # staged-against-built comparison cannot see this - the restored file is on
+    # both sides of it - so only the stamp can.
+    [System.IO.File]::WriteAllBytes($stampSys, [byte[]](1, 2, 3, 9))
+    Assert-True ((Invoke-Stamp "-Check" $stampWork) -eq 1) `
+        "a binary swapped under an unchanged stamp must be refused (audit H13)."
+    [System.IO.File]::WriteAllBytes($stampSys, [byte[]](1, 2, 3, 4))
+
+    # A stamp written before the BINARY line existed. Sources agree, identity
+    # is unavailable: exit 2, which is the ONLY case -AllowUnstampedDriver may
+    # wave through.
+    $legacy = @(Get-Content -LiteralPath $stampFile | Where-Object { $_ -notmatch '^BINARY ' })
+    Set-Content -LiteralPath $stampFile -Value $legacy -Encoding ascii
+    Assert-True ((Invoke-Stamp "-Check" $stampWork) -eq 2) `
+        "a stamp with no BINARY line but matching sources must answer 2, not 0: it cannot vouch for the binary."
+
+    # ...and the regression that ordering caused. A legacy stamp whose SOURCES
+    # have changed must still be the unbypassable 1, not the waveable 2 - the
+    # first cut answered 2 the moment it saw no BINARY line, before comparing
+    # any sources at all, which made the oldest guarantee bypassable for
+    # exactly the binaries least able to afford it.
+    $mutated = @($legacy | ForEach-Object {
+        if ($_ -match 'xhci_log\.h$') { ("0" * 64) + " xhci_log.h" } else { $_ }
+    })
+    Set-Content -LiteralPath $stampFile -Value $mutated -Encoding ascii
+    Assert-True ((Invoke-Stamp "-Check" $stampWork) -eq 1) `
+        "a legacy stamp whose sources have CHANGED must answer 1, not the 2 that -AllowUnstampedDriver can wave through."
+
+    # A source ADDED and a source REMOVED, which are the two kinds of drift the
+    # hash comparison reports differently from "contents differ" - a file the
+    # build gained, and one it lost. Both must refuse, and from a legacy stamp
+    # too, since that is the format this ordering is about.
+    $dropped = @($legacy | Where-Object { $_ -notmatch 'xhci_log\.h$' })
+    Set-Content -LiteralPath $stampFile -Value $dropped -Encoding ascii
+    Assert-True ((Invoke-Stamp "-Check" $stampWork) -eq 1) `
+        "a source file the stamp does not name - one added since the build - must be refused."
+    $added = @($legacy) + @(("0" * 64) + " nosuchfile.h")
+    Set-Content -LiteralPath $stampFile -Value $added -Encoding ascii
+    Assert-True ((Invoke-Stamp "-Check" $stampWork) -eq 1) `
+        "a source file the stamp names but src\ no longer has - one removed since the build - must be refused."
+
+    # And the same source mismatch under a current-format stamp.
+    [System.IO.File]::WriteAllBytes($stampSys, [byte[]](1, 2, 3, 4))
+    Assert-True ((Invoke-Stamp "-Write" $stampWork) -eq 0) `
+        "source-stamp.ps1 -Write failed on the second write."
+    $mutated = @(Get-Content -LiteralPath $stampFile | ForEach-Object {
+        if ($_ -match 'xhci_log\.h$') { ("0" * 64) + " xhci_log.h" } else { $_ }
+    })
+    Set-Content -LiteralPath $stampFile -Value $mutated -Encoding ascii
+    Assert-True ((Invoke-Stamp "-Check" $stampWork) -eq 1) `
+        "a current-format stamp whose sources have changed must be refused."
+
+    # No stamp at all is 2, not a pass: the caller decides, and make-release.ps1
+    # refuses unless -AllowUnstampedDriver says otherwise.
+    Remove-Item -LiteralPath $stampFile -Force
+    Assert-True ((Invoke-Stamp "-Check" $stampWork) -eq 2) `
+        "a directory with no stamp must answer 2."
+
+    # A directory with no binary at all is an ERROR, not a 2. It must not join
+    # the one code -AllowUnstampedDriver can wave through: "there is nothing
+    # here to publish" is not "this binary's provenance is unknown".
+    $emptyDir = Join-Path $script:work "stamp-nobinary"
+    New-Item -ItemType Directory -Path $emptyDir | Out-Null
+    Assert-True ((Invoke-Stamp "-Write" $emptyDir) -ne 0) `
+        "stamping a directory with no xhci98.sys in it must fail."
+    Assert-True ((Invoke-Stamp "-Write" $emptyDir) -ne 2) `
+        "...and must not fail with 2, which is the code -AllowUnstampedDriver accepts."
 
     Write-Step "the binary-vs-INF version comparison"
     #

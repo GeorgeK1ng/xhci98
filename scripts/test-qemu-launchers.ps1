@@ -37,17 +37,7 @@ $targets = @(
 )
 $work = Join-Path ([System.IO.Path]::GetTempPath()) `
     ("xhci98-qemu-launcher-test-" + [System.IO.Path]::GetRandomFileName())
-$script:failures = @()
-$script:checks = 0
-
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    $script:checks++
-    if (-not $Condition) {
-        $script:failures += $Message
-        Write-Host "FAIL: $Message" -ForegroundColor Red
-    }
-}
+. (Join-Path $PSScriptRoot "test-harness.ps1")
 
 try {
     $bin = Join-Path $work "bin"
@@ -86,6 +76,31 @@ try {
             "the $name launcher still appends stale output instead of creating a per-boot trace."
         Assert-True ($text.IndexOf($moveLine) -lt $text.IndexOf($chardevLine)) `
             "the $name launcher does not archive the prior log before QEMU opens the new trace."
+        if ($name -eq "Win98" -or $name -eq "Win2000") {
+            # build-and-test.md, "A floppy can be inserted live without a
+            # reboot": `change floppy0 <path>` on the monitor is the
+            # guest-to-host courier for 2a and 2b, and a floppy CONTROLLER
+            # cannot be added to a running guest - so it has to be on the run
+            # launcher at boot. The 2026-09-07 audit's H27 was that the doc had
+            # claimed this since batch 13-L with no generator writing it; its
+            # first fix then put the drive on 2b's PREPARATION launcher, which
+            # is booted once and never during a matrix run, so the claim stayed
+            # false for the launcher the doc is about. This asserts the
+            # generated text, which is the only thing that survives a
+            # regenerated `scripts\local\`.
+            Assert-True ($text -match '(?m)^\s*-drive if=floppy') `
+                "the $name run launcher has no floppy controller, so a file cannot be couriered out of a running guest."
+        }
+        if ($name -eq "Win2000") {
+            # ...and EMPTY on 2b, because `vm\transfer.img` is one file that
+            # every guest shares and the Windows 98 run launcher mounts it
+            # WRITABLE. Two guests up at once with the same raw floppy image
+            # is a FAT volume with two writers and no arbitration. The drive is
+            # what has to exist at boot; the disk is chosen later, per guest,
+            # with `change floppy0`.
+            Assert-True ($text -notmatch '(?m)^\s*-drive if=floppy,file=') `
+                "the Windows 2000 run launcher mounts a floppy image at boot; vm\transfer.img is shared with the Windows 98 guest, which mounts it writable, so booting both would hand one image to two writers."
+        }
         if ($name -eq "Win2000SMP") {
             Assert-True ($text.Contains("-accel whpx,kernel-irqchip=off")) `
                 "the Win2000 SMP launcher does not default to the proven WHPX rung."
@@ -252,6 +267,57 @@ try {
     Assert-True ($meText.Contains("-machine pc ^") -and $meText.Contains("-cpu pentium3 ^") -and
         $meText.Contains("-action reboot=reset -no-shutdown ^")) `
         "the Windows ME launcher lost the machine, CPU or reboot flags the Windows 98 recipe fixes."
+
+    #
+    # **NO TWO GUESTS MAY SHARE A QEMU MONITOR PORT**, and nothing checked it
+    # until the 2026-09-07 audit's H31. Two launchers on one port cannot both
+    # run: the second QEMU fails to bind and dies, or - worse, and this is the
+    # one that costs a run - the harness connects to the FIRST guest's monitor
+    # believing it is talking to the second, and every reading it takes is of
+    # the wrong machine.
+    #
+    # It has happened twice. The Windows ME launcher took 55558, which is the
+    # ACPI-HAL Windows 2000 machine's, until the 2026-09-05 audit; it then took
+    # 55560, which is the xHCI-only Windows 2000 machine's, until the
+    # 2026-09-07 one. Both were found by reading, not by a check - which is the
+    # argument for this being the cheap check it is: the ports are written into
+    # the generators as arithmetic on a base, so a collision is a sum nobody
+    # evaluated.
+    #
+    # Every launcher this file generated is scanned, install and run alike:
+    # an install launcher colliding with a run launcher matters just as much,
+    # since the prepare and install passes are exactly when a second guest is
+    # most likely to be up.
+    #
+    $portsSeen = @{}
+    foreach ($dir in @($launchers, $fallbackLaunchers, $meLaunchers)) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        foreach ($cmd in (Get-ChildItem -LiteralPath $dir -File -Filter "*.cmd")) {
+            foreach ($line in [System.IO.File]::ReadAllLines($cmd.FullName)) {
+                if ($line -match 'tcp:127\.0\.0\.1:(\d+),server') {
+                    $port = $Matches[1]
+                    # One generator writing the same port into its own install,
+                    # prepare and run launchers is correct and expected: they
+                    # are the same guest at three moments and never run at
+                    # once. What must not happen is two DIFFERENT guests
+                    # sharing one, so the key is the port and the value is the
+                    # set of launcher STEMS, with the guest's own suffix
+                    # removed.
+                    $guest = $cmd.BaseName -replace '-(install|prepare-usbd|run|usb-test|net-storage-test)$', ''
+                    if (-not $portsSeen.ContainsKey($port)) { $portsSeen[$port] = @() }
+                    if ($portsSeen[$port] -notcontains $guest) { $portsSeen[$port] += $guest }
+                }
+            }
+        }
+    }
+    Assert-True ($portsSeen.Count -gt 0) `
+        "no monitor port was found in any generated launcher, so this check measured nothing."
+    foreach ($port in ($portsSeen.Keys | Sort-Object)) {
+        Assert-True ($portsSeen[$port].Count -le 1) `
+            ("monitor port {0} is used by more than one guest: {1}. Two guests on one port cannot both run, and a harness that connects to it reads whichever one answered." -f `
+                $port, (($portsSeen[$port] | Sort-Object) -join ", "))
+    }
+    Write-Ok ("{0} monitor port(s) across the generated launchers, none shared" -f $portsSeen.Count)
 } finally {
     if (Test-Path -LiteralPath $work) {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue

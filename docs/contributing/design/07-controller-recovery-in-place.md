@@ -104,8 +104,13 @@ from it.
       XhciRecoverController:
           XhciControllerBeginQuiesce   retire the command engine and the
                                        root-hub timers, drop INITIALIZED
-          XhciSlotInvalidateAll        drop every device, completing the
-                                       transfers usbport is holding
+          read USBSTS                  is the xHC halted? (all ones is not
+                                       a halt) - the `halted` argument below
+          XhciSlotInvalidateAll        drop every device: release the records
+                                       whose slots the halt proves gone,
+                                       abandon the rest in place
+          XhciSlotDeferredWork         deliver the completions that release
+                                       owed usbport
           XhciInitController(NULL)     HCRST and the whole sequence, with
                                        ext->InitBelowPassive set
           XhciEnableInterrupts         if usbport had asked for interrupts
@@ -149,7 +154,7 @@ it:
 | Site | What it does while set | Why |
 |---|---|---|
 | `XhciWaitForBits` | skips the sleep phase entirely; the wait is the existing 10 ms stall and nothing more | `UsbPortWait` is `KeDelayExecutionThread`. Not extended to busy-wait the full timeout: that would spin a DPC for the better part of a second on hardware that has already failed. A bit that does not settle inside the stall makes the attempt refuse, and the extra time comes from the next attempt rather than from a spin. |
-| `XhciDelayMs` | stalls instead of sleeping | Same reason. It is 20 ms once per attempt, the port-power settle, which the specification states as a duration rather than as a condition. |
+| `XhciDelayMs` | stalls instead of sleeping | Same reason. The port-power routine `xhciPowerPorts` reaches it through `xhciSettlePortPower`, twice per attempt: each call may spend an optional 20 ms transition delay (the specification states it as a duration, not a condition) plus up to 20 ms of confirmation polling in 5 ms steps, so that routine alone can stall for 60 ms in an attempt. That bounds the power-up step, not the whole recovery, which has other bounded waits and a possible teardown ahead of it. |
 | `XhciInitController` | skips the three PCI configuration-space reads (identification, the INTx gate, the bus-master gate) | `UsbPortReadWriteConfigSpace` goes out to the bus driver; this project's contract for it is PASSIVE_LEVEL. |
 | `xhciTryClearBusMaster` | declines outright | Same service. The proof it would obtain is unavailable, and on this path unnecessary (see below). |
 | `XhciFailClosedDma` | counts (`DmaFailClosedDeferred`) instead of bugchecking | The bugcheck's premise is a reclamation and this path has none. It is justified by usbport being about to take the common buffer back while an xHC that may still be mastering points at it. On the recovery path nothing is handing anything back, so the block stays this driver's. Taking a machine down here would turn a stall into a crash, the opposite of the task. |
@@ -229,11 +234,71 @@ the sequence ran) and `RecoveryLastStatus` carrying the `HcInfoStatus` that
 stopped it. A bound that is only decremented on the path that does work is not
 a bound.
 
+A lost delivery spends budget too, and this was not so until the 2026-09-05
+audit (roadmap Phase 20, F2). `UsbPortRequestAsyncCallback` answers 0 on
+success and 0 on its own pool-allocation failure, so an arming that produced
+no callback is indistinguishable at the call. The first version set
+`RecoveryArmed`, cleared the request, and left the two as they were: the
+attempts are counted only when a recovery runs, so the loss cost no attempt,
+and the comment beside the call that said "costs one attempt, bounded by the
+cap" described a bound that did not exist. The audit's host model armed once,
+discarded the callback and polled a hundred times: `armed=1 requested=0
+attempts=0`, stable.
+
+The repair is an age-out with a delivery generation. The health poll is the
+clock, because it is the one periodic context that survives the latch
+(`PollClockMs` stops advancing while `ControllerFailed` is set, so it cannot
+be). Every arming stamps `RecoveryGeneration` into its context and resets
+`RecoveryArmedPolls`; every poll that finds an arming out advances that count,
+and at `XHCI_RECOVERY_DELIVERY_POLLS` (20, about ten seconds at the nominal
+period against a 50 ms delay) the arming is declared lost: released, the
+request put back, `RecoveryDeliveriesLost` and `RecoveryFailuresConsecutive`
+both incremented, and the generation advanced. The same poll then arms the next
+generation through the ordinary predicate. A callback whose generation is not
+the current one is declined (`RecoveryCallbacksLate`) before it touches the
+latch, so a delivery that was merely slow cannot run a recovery beside the one
+its replacement owns, and two recoveries cannot start from one loss. Polls
+while `SUSPENDED` do not age an arming, for the reason section 8.1 gives; a
+restart zeroes all of it with the extension. Repeated loss therefore reaches
+the same bounded terminal state a refusing controller does, which is what the
+cap has to mean to be a bound.
+
+The charge is made only while the latch still stands. An arming can outlive
+its purpose: another path (a reinitialising resume, an earlier recovery)
+clears `ControllerFailed` while it is out. Ordinarily its callback then
+arrives, finds the latch clear, counts itself stale and releases the arming;
+a resume does not move the start epoch (only `XhciCommandInit` does, from
+`StartController`), so the callback still matches, and the suspend vector in
+`test_init` delivers it and asserts exactly that. When that callback was lost
+as well, the age-out retires the arming with nothing owed and nothing
+charged, counted in `RecoveryStaleCallbacks`, because spending a healthy
+controller's budget on a recovery it no longer needed is the expiry-date
+defect Finding T describes, one step removed. (The first version of this
+paragraph said the resume's epoch move orphaned the arming; the Phase 20
+review found the vector behind it firing the mock's command watchdog instead
+of the recovery callback.)
+
 The difference the repair makes is not that failure became impossible. Failure
-became measured: `RecoveryAttempts`, `RecoveryFailures` and
-`RecoveryLastStep`/`RecoveryLastStatus` are readable from a release build, so
-"the controller would not come back, and it refused at step N" is a finding
-rather than a silence.
+became measured: `RecoveryAttempts`, `RecoveryFailures`,
+`RecoveryDeliveriesLost` and `RecoveryLastStep`/`RecoveryLastStatus` are
+readable from a release build, so "the controller would not come back, and it
+refused at step N" is a finding rather than a silence.
+
+One more thing has to reopen for the bound to hold across recoveries: the
+health poll's transition latch, `ControllerFatal`, which makes an HCE or HSE
+escalate once rather than on every 500 ms poll. It was written before this
+recovery existed, when a fatal bit really did stay set for the life of the
+driver, and nothing reopened it. The HCRST this recovery passes clears both
+bits, so after one completed recovery a second fatal was a repetition to the
+latch and was never escalated: the controller was dead until reboot, the
+state section 1 describes, one recovery later. Measured on the Windows 2000
+SMP guest on 2026-09-06 with an HCE provoked from outside the guest (the
+interrupter's ERSTBA written to an unmapped address through QEMU's gdb
+stub): the first recovered cleanly, the next three set HCE with
+`ResetControllerCalls` still 1. `XhciInitController` now clears the fatal
+latch with `ControllerFailed`, `test_fatal_after_recovery` pins it, and the
+same four provocations on the corrected build read four recoveries
+completed, none refused (roadmap Phase 20, F19).
 
 ## 8. The known window, recorded rather than closed
 
@@ -347,8 +412,9 @@ may be read as saying:
   backstop. `XHCI_COMMAND_AGE_POLLS` was 64 polls, sized against a nominal
   500 ms period this machine does not have. Finding V measured the E460's poll
   at 36-80 ms, so the backstop stood at 2.3-5.1 s against
-  `XHCI_COMMAND_TIMEOUT_MS` = 5,000, at or under the watchdog it was sized to
-  sit 12 s behind. That is the whole of `CommandsTimedOut 0` across 76, 635 and
+  `XHCI_COMMAND_TIMEOUT_MS` = 5,000: at or under the watchdog, where 32 s was
+  sized to sit 12 s clear of the ladder's 20 s legitimate worst case
+  (`XHCI_COMMAND_TIMEOUT_MS` plus three `XHCI_COMMAND_ABORT_MS` waits). That is the whole of `CommandsTimedOut 0` across 76, 635 and
   123 commands on three boots. Task 13-R.3.5 repaired it by making every budget
   a duration in milliseconds on `PollClockMs`.
 - An earlier reading that "the xHC does not answer a Command Abort in this

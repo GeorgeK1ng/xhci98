@@ -1763,9 +1763,17 @@ ULONG XhciHcInfoEqual(const XHCI_HC_INFO *a, const XHCI_HC_INFO *b);
  */
 #define XHCI_USBLEGSUP_BYTES         8UL
 #define XHCI_USBLEGCTLSTS_OFFSET     4UL
-/* USBLEGCTLSTS: every SMI enable is in 15:0, and the RW1C status bits the
- * handoff acknowledges are 31:29. */
-#define XHCI_USBLEGCTLSTS_SMI_ENABLES   0x0000FFFFUL
+/*
+ * USBLEGCTLSTS (Table 7-5 p.479). The SMI enables are five bits - 0, 4, 13,
+ * 14 and 15 - not the whole low half: 3:1, 12:5 and 19:17 are RsvdP, which a
+ * write must carry back as read. The handoff's mask was 0x0000FFFF until the
+ * 2026-09-05 audit's F13 and zeroed the RsvdP fields, the class of error the
+ * RsvdP helpers in xhci_init.c exist to prevent for the operational
+ * registers. The RW1C status bits the handoff acknowledges are 31:29; 28:21
+ * are RsvdZ and 16 and 20 are read-only status.
+ */
+#define XHCI_USBLEGCTLSTS_SMI_ENABLES   0x0000E011UL
+#define XHCI_USBLEGCTLSTS_RSVDP         0x000E1FEEUL
 #define XHCI_USBLEGCTLSTS_SMI_STATUS    0xE0000000UL
 
 /* Supported Protocol (spec 7.2). */
@@ -2964,6 +2972,12 @@ ULONG XhciRingSetDequeue(PXHCI_RING ring, ULONG dequeuePA);
  */
 ULONG XhciRingNoOpAt(PXHCI_RING ring, ULONG index);
 
+/* The same rewrite with the TRB type named by the caller: XHCI_TRB_TYPE_NOOP
+ * (8) is a transfer ring's No Op and XHCI_TRB_TYPE_NOOP_COMMAND (23) is the
+ * command ring's, and the two are not interchangeable - a type 8 on the command
+ * ring is a TRB Error (roadmap Phase 20, F12). XhciRingNoOpAt is this with 8. */
+ULONG XhciRingNoOpAtType(PXHCI_RING ring, ULONG index, ULONG trbType);
+
 /* The physical address the dequeue pointer currently sits at - the value a Set
  * TR Dequeue Pointer command must carry so the two pointers agree. 16-byte
  * aligned, so the command's DCS and SCT bits are OR'd into the low bits. */
@@ -3661,6 +3675,13 @@ typedef struct _XHCI_TRANSFER_QUEUE {
     ULONG Recoveries;
     ULONG UnmatchedEvents;  /* resolved to a ring index owned by no transfer */
     ULONG ForeignEvents;    /* did not resolve to this ring at all           */
+    /* Events whose TRB Pointer carried a nonzero RsvdZ 3:0. Masked off before
+     * the ring lookup (a conforming controller leaves them clear, and refusing
+     * a real completion over a bit the spec says is not there would leave the
+     * transfer to usbport's timeout), counted because a controller that sets
+     * them is a finding. The command path has done both since Phase 4; the
+     * transfer paths read the bits raw until the 2026-09-05 audit. */
+    ULONG ReservedBitsSet;
     ULONG EventDataEvents;  /* ED = 1: this driver places no Event Data TRBs */
     ULONG BadCodes;         /* impossible for this ring, or unassigned       */
     /* Codes 26-28 handed to `XhciXferEvent`: the slot layer owns those
@@ -5070,9 +5091,13 @@ typedef struct _XHCI_EXTENSION {
      * signal. SuspendFailures counts suspends where the controller would neither
      * halt nor give up bus mastering - i.e. it may have entered D3 still capable
      * of DMA. On Win98 these grow steadily by design: NUSB's usbport issues
-     * suspend/resume pairs repeatedly at idle, where native Win2000 usbport
-     * never idle-suspended at all, so a steadily rising SuspendCount on one
-     * target and a static one on the other is the expected shape.
+     * suspend/resume pairs repeatedly at idle (and XP's idles the controller
+     * about thirty seconds after a start with nothing attached), so a
+     * steadily rising SuspendCount there is the expected shape. On Win2000 it
+     * has read 0 in every run recorded so far, and on 2026-09-06 it read 0
+     * with the value deleted too, nothing attached and then a mouse, in the
+     * conditions build-and-test.md records on both HALs (roadmap Phase 20,
+     * F18). So read a nonzero there as a finding to record, not as a fault.
      */
     ULONG SuspendCount;
     ULONG SuspendUsbCmd;
@@ -5320,12 +5345,20 @@ typedef struct _XHCI_EXTENSION {
      * ControllerFatal is set the first time USBSTS reports HCE or HSE and is
      * what makes the escalation a *transition* rather than a repetition: HCE is
      * read-only and HSE is deliberately left unacknowledged - clearing an RW1C
-     * bit would destroy the record on a path that has already decided not to
-     * retry in place - so both stay set, and without this latch every 500 ms
-     * poll would ask usbport to queue another reset.
+     * bit would destroy the record of why the controller failed before the
+     * recovery has run - so both stay set, and without this latch the polls
+     * still admitted before ResetController closes admission (and every poll,
+     * should that call never arrive) would ask usbport to queue another reset.
      *
      * It is distinct from ControllerFailed, which is the *answer*: this says the
      * hardware reported a fatal condition, that says the ladder has ended.
+     * Both are cleared together inside a reinitialization, once its HCRST
+     * has completed and the post-reset capability check has passed
+     * (XhciInitController), before the steps that can still refuse: that
+     * HCRST has cleared the bits this one answered, so a later report is a
+     * new transition. Measured on the SMP guest on 2026-09-06: with this
+     * latch left standing, a second HCE after a completed in-place recovery
+     * was never escalated.
      * LastCheckStatus is the raw word behind the decision, readable from a free
      * build; HealthPollsDead counts polls that read all ones, which is a window
      * that has stopped decoding and is deliberately not treated as a fatal-bit
@@ -5440,6 +5473,19 @@ typedef struct _XHCI_EXTENSION {
     ULONG CommandsTimedOut;
     ULONG CommandsAborted;       /* Command Aborted events (code 25)         */
     ULONG CommandRingStops;      /* Command Ring Stopped events (code 24)    */
+    /*
+     * A Command Ring Stopped whose reported dequeue pointer still named the
+     * command the abort had given up on - the xHC never fetched it, so the
+     * abort had nothing to advance past (the 2026-09-05 audit's F12). Adopting
+     * that position would have left the abandoned TRB valid at the head of the
+     * ring, for the next doorbell to execute ahead of the command that
+     * doorbell was rung for, with a completion no outstanding command matched.
+     * The TRB is rewritten in place as a No Op Command (type 23) before the
+     * position is adopted, and `CommandNoOpRewrittenPA` remembers it so its
+     * completion is retired as the rewrite's rather than counted unmatched.
+     */
+    ULONG CommandRingStoppedOnAbandoned;
+    ULONG CommandNoOpRewrittenPA;
     /*
      * A Command Ring Stopped event naming a dequeue position this driver's ring
      * cannot hold. It is not repaired here: CRCR's Command Ring Pointer is bits
@@ -5685,6 +5731,40 @@ typedef struct _XHCI_EXTENSION {
      * one".
      */
     ULONG RecoveryFailuresConsecutive;
+
+    /*
+     * **A lost delivery is aged out, not waited on for ever** (the 2026-09-05
+     * audit's F2). `UsbPortRequestAsyncCallback` answers 0 on success and 0 on
+     * its own pool-allocation failure, so an arming that produced no callback
+     * is indistinguishable at the call - and the first version of this latch
+     * then sat with `RecoveryArmed` set and nothing ever clearing it: the
+     * attempts are counted only when a recovery *runs*, so the "costs one
+     * attempt, bounded by the cap" reasoning was false, and a controller whose
+     * one arming was lost stayed latched with a recovery owed for ever.
+     *
+     * `RecoveryGeneration` is stamped into every armed context and advanced by
+     * every arming and every age-out, so a callback from an expired arming is
+     * recognised and declined (`RecoveryCallbacksLate`) rather than running a
+     * recovery beside the one the current arming owns. `RecoveryArmedPolls`
+     * counts the health polls since the arming - `CheckController` keeps
+     * running while `ControllerFailed` is set, which is what makes it the one
+     * clock that can age this; `PollClockMs` does not advance on a failed
+     * controller - and a delay of XHCI_RECOVERY_DELAY_MS that has not been
+     * delivered after XHCI_RECOVERY_DELIVERY_POLLS of them is declared lost
+     * (`RecoveryDeliveriesLost`): the arming is released, the request is put
+     * back, and the loss is charged to `RecoveryFailuresConsecutive`, so
+     * repeated loss reaches the same bounded terminal state a refusing
+     * controller does. Polls while SUSPENDED do not age it; usbport gates its
+     * own timer on HC_SUSPEND, and the callback declines then anyway. An
+     * arming aged out with the latch already clear (another path brought the
+     * controller back while it was out, and its own callback - which would
+     * have counted itself stale and released it - was lost too) is retired
+     * with nothing charged and counted in `RecoveryStaleCallbacks`.
+     */
+    ULONG RecoveryGeneration;
+    ULONG RecoveryArmedPolls;
+    ULONG RecoveryDeliveriesLost;
+    ULONG RecoveryCallbacksLate;
 
     /*
      * Nonzero for exactly as long as an initialization sequence is running
@@ -6357,6 +6437,20 @@ typedef struct _XHCI_EXTENSION {
      */
     ULONG TransfersFailedGone;
     /*
+     * Transfers submitted through an endpoint extension that is not the one
+     * the record is bound to: a superseded handle (the two-handle restore of
+     * issue 4, or a handle whose device record has since been released and
+     * reused for another device). Its own counter beside `TransfersFailedGone`
+     * because the diagnosis differs: "gone" is a record with no binding at
+     * all, this is a record bound to a *different* extension, so the work
+     * usbport offered belongs to a handle it has already replaced. Failed
+     * with `CANCELED` rather than refused, by the permanent-refusal rule above
+     * - the old handle never becomes the bound one again - and the replacement
+     * handle's queue is never touched (the 2026-09-05 audit's F1, whose third
+     * probe queued a transfer on the live device through a closed old handle).
+     */
+    ULONG TransfersFailedStale;
+    /*
      * Device records failed by the health poll's progress detector: refusing
      * transfers, no command in flight, and nothing placed on a ring for
      * XHCI_DEV_STALL_MS of consecutive polls. This is the **bound** on task
@@ -6604,6 +6698,7 @@ typedef struct _XHCI_EXTENSION {
      * structure already uses for other things.
      */
     ULONG ForeignEventsTotal;
+    ULONG TransferEventsReservedBitsSet;   /* folded XHCI_TRANSFER_QUEUE.ReservedBitsSet */
     ULONG EventDataEventsTotal;
     ULONG BadCodesTotal;
     ULONG QueueErrorsTotal;
@@ -6907,6 +7002,31 @@ typedef struct _XHCI_EXTENSION {
      * binds on its first attach while it moves is issue 4 handled.
      */
     ULONG Ep0RemovesSuperseded;
+    /*
+     * The same reading for a non-default endpoint: `SetEndpointState(REMOVE)`
+     * through an extension the record at that DCI is bound to a *different*
+     * one than. Until the 2026-09-05 audit (F1) this REMOVE cleared the
+     * record's pointer to the live handle and could start tearing down its
+     * queue; now it closes its own extension and touches nothing else, as the
+     * EP0 branch has since issue 4. No supported stack has been observed to
+     * deliver it - the two-handle restore XP performs had only EP0 open - so
+     * nonzero is a reading worth the trace that names the sequence.
+     */
+    ULONG EndpointRemovesSuperseded;
+    /*
+     * Every other endpoint callback that named a stale extension and was
+     * declined for it: `SetEndpointState(PAUSED|ACTIVE)`, `GetEndpointStatus`
+     * and `SetEndpointStatus(RUN)`. A stale PAUSED would have stopped the
+     * replacement handle's endpoint and a stale RUN would have reset its
+     * pipe (F1's second probe paused the live EP0 through the old handle).
+     * Two calls are deliberately not counted here because they are about work
+     * the old handle still owns on the shared queue: `AbortTransfer`, which
+     * withdraws a transfer by the transfer's own identity, and a PAUSED from
+     * a superseded handle that still has a transfer of its own queued
+     * (`xhciEpHandleOwnsWork`), which is usbport cancelling that work and
+     * needs the early stop.
+     */
+    ULONG EndpointCallsStale;
     ULONG EndpointQuiesceLost;
     ULONG EndpointQuiesceUnavailable;
     ULONG EndpointQuiesceFailures;
@@ -7429,6 +7549,17 @@ typedef struct _XHCI_EXTENSION {
      * restore that has been consumed - because a restore attempted without one
      * is undefined behaviour rather than a failed restore (4.23.2, p.315). */
     ULONG SavedStateValid;
+    /*
+     * IMOD as it read at the save, written back by the restore (4.23.2 p.314
+     * lists IMOD among the registers software writes before CRS, and "the
+     * Restore operation overwrites internal default values asserted by a xHC
+     * reset"). The start never writes IMOD, so on every path but this one the
+     * interrupter runs at the reset default of 4000 (1 ms), which is what the
+     * isochronous builder's IOC-per-TD policy leans on; the restore used to
+     * write 0 here, so a successful restore silently removed that moderation
+     * (the 2026-09-05 audit's F10). Meaningful only while `SavedStateValid`.
+     */
+    ULONG SavedImod;
 
     /*
      * Task 6-V.1's transfer-contract probe (src/xhci_probe.c). Instrumentation
@@ -7605,8 +7736,10 @@ typedef struct _XHCI_EXTENSION {
  * channel would have kept most of the defect it repairs: the user whose
  * machine misbehaves is running `release`, and telling them to install a
  * second binary before they can report anything is the same shape as telling
- * them to install one that does not load. **The flavour decides how much there
- * is to read, not whether the door exists.**
+ * them to install one that does not load. **The verbosity level decides how
+ * much there is to read; the flavour decides neither that nor whether the
+ * door exists** - all three flavours record the same (design record 08,
+ * section 5).
  *
  * **The door is shut until it is asked for.** `XhciLogVerbosity` in the
  * driver's own software key defaults to 0, and **rung 0 of that ladder IS the

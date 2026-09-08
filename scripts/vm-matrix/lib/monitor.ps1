@@ -87,7 +87,53 @@ function Send-Mon {
         $client = New-Object System.Net.Sockets.TcpClient
         $client.Connect("127.0.0.1", $Port)
         $stream = $client.GetStream()
-        Start-Sleep -Milliseconds 150
+
+        #
+        # **SYNCHRONISE ON THE BANNER'S PROMPT, THEN DRAIN, THEN SEND.**
+        #
+        # This used to sleep 150 ms, drain whatever had arrived, and send. The
+        # race that leaves is the 2026-09-07 audit's H19, and it produces the
+        # exact reading the completeness test below exists to prevent. QEMU
+        # prints its banner and a `(qemu)` prompt on connect; if that lands
+        # AFTER the drain - a loaded host, a guest mid-boot, a third client
+        # queued ahead of this one - the banner's own prompt is still in the
+        # buffer when the command goes out. If the guest is then slow to
+        # answer, the idle window closes on a buffer whose tail is that
+        # prompt, `Test-MonitorReplyComplete` says the reply is complete, and
+        # the caller gets an EMPTY complete reply. For `info usb` that reads as
+        # "the device is not listed", which is a departure that never happened
+        # - the same wrong reading audit S-6 fixed from the other side.
+        #
+        # So the connect prompt is waited for and consumed here, and only then
+        # is anything sent. A monitor that does not produce one within the
+        # window is NOT synchronised, and the command is not sent at all: the
+        # first cut of this said so out loud and then sent anyway, which left
+        # the whole race in place behind a warning nobody reads in a matrix log
+        # thousands of lines long. A refusal here costs one row marked as a
+        # monitor error, which is what an unsynchronised monitor is; sending
+        # costs a departure that never happened.
+        #
+        $banner = New-Object System.Text.StringBuilder
+        $sync = [Diagnostics.Stopwatch]::StartNew()
+        $syncBuf = New-Object byte[] 4096
+        while ($sync.ElapsedMilliseconds -lt 2000 -and
+               -not (Test-MonitorReplyComplete -Raw $banner.ToString())) {
+            if ($stream.DataAvailable) {
+                $n = $stream.Read($syncBuf, 0, $syncBuf.Length)
+                if ($n -gt 0) {
+                    [void]$banner.Append([System.Text.Encoding]::ASCII.GetString($syncBuf, 0, $n))
+                }
+            } else {
+                Start-Sleep -Milliseconds 20
+            }
+        }
+        if (-not (Test-MonitorReplyComplete -Raw $banner.ToString())) {
+            Write-Host ("monitor: no (qemu) prompt on connect within 2000 ms before '{0}'; the reply could not be separated from the banner, so nothing was sent" -f $Command)
+            $script:MonitorErrors++
+            $stream.Close(); $client.Close()
+            return $null
+        }
+        # Anything still queued behind the prompt is not this command's.
         while ($stream.DataAvailable) { $null = $stream.ReadByte() }
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($Command + "`n")
         $stream.Write($bytes, 0, $bytes.Length)
@@ -120,9 +166,9 @@ function Send-Mon {
         # reply without a trailing `(qemu)` is given a second window, and one
         # that still lacks it is an error and returns nothing rather than a
         # fragment a caller could mistake for the whole answer.
-        if (-not (Test-MonitorReplyComplete -Raw $sb.ToString())) {
+        if (-not (Test-MonitorReplyComplete -Raw $sb.ToString() -Echo $Command -RequireEcho)) {
             $more = [Diagnostics.Stopwatch]::StartNew()
-            while ($more.ElapsedMilliseconds -lt $HardMs -and -not (Test-MonitorReplyComplete -Raw $sb.ToString())) {
+            while ($more.ElapsedMilliseconds -lt $HardMs -and -not (Test-MonitorReplyComplete -Raw $sb.ToString() -Echo $Command -RequireEcho)) {
                 if ($stream.DataAvailable) {
                     $n = $stream.Read($buf, 0, $buf.Length)
                     if ($n -gt 0) { [void]$sb.Append([System.Text.Encoding]::ASCII.GetString($buf, 0, $n)) }
@@ -132,8 +178,8 @@ function Send-Mon {
             }
         }
         $stream.Close(); $client.Close()
-        if (-not (Test-MonitorReplyComplete -Raw $sb.ToString())) {
-            Write-Host ("monitor: no (qemu) prompt came back after '{0}' within {1} ms; the reply is incomplete and is not used" -f $Command, ($HardMs * 2))
+        if (-not (Test-MonitorReplyComplete -Raw $sb.ToString() -Echo $Command -RequireEcho)) {
+            Write-Host ("monitor: no (qemu) prompt came back after '{0}'s own echo within {1} ms; the reply is incomplete and is not used" -f $Command, ($HardMs * 2))
             $script:MonitorErrors++
             return $null
         }
@@ -147,10 +193,41 @@ function Send-Mon {
 
 # The monitor's prompt is the end-of-reply marker: QEMU prints `(qemu) ` after
 # every command's output, including a command that printed nothing.
+#
+# `-Echo` names the command that was sent. When it is given, the prompt only
+# counts if it comes AFTER that command's echo - which is the second half of
+# the 2026-09-07 audit's H19, and the belt to the connect-time
+# synchronisation's brace. QEMU echoes what is written to the monitor, so the
+# echo is where this command's reply begins; a prompt sitting before it
+# belongs to the banner or to somebody else's command, and accepting it hands
+# the caller an empty answer that reads as a real one.
+#
+# By default the echo is not required to be PRESENT: this function is also
+# used on the connect banner, which answers no command, and on accumulated
+# text that starts mid-reply. What is always required is that no prompt is
+# accepted BEFORE the echo when the echo is there.
+#
+# `-RequireEcho` closes the rest of the hole, and `Send-Mon` passes it,
+# because QEMU's HMP always echoes what is written to it. Without it a reply
+# whose echo has not arrived yet is judged on whatever prompt IS in the
+# buffer - the banner's, if the connect-time drain lost the race - and an
+# empty reply comes back marked complete. That is the reading the whole of
+# H19 is about, and no timeout can see it, because from a timeout's side a
+# prompt is a prompt.
+#
 function Test-MonitorReplyComplete {
-    param([string]$Raw)
+    param([string]$Raw, [string]$Echo = "", [switch]$RequireEcho)
     if ($null -eq $Raw) { return $false }
     $clean = $Raw -replace "\x1b\[[0-9;]*[A-Za-z]", "" -replace "\x08", ""
+    $sawEcho = $false
+    if ($Echo -ne "") {
+        $at = $clean.IndexOf($Echo, [System.StringComparison]::Ordinal)
+        if ($at -ge 0) {
+            $sawEcho = $true
+            $clean = $clean.Substring($at + $Echo.Length)
+        }
+    }
+    if ($RequireEcho -and -not $sawEcho) { return $false }
     return ($clean.TrimEnd() -match '\(qemu\)$')
 }
 
@@ -165,6 +242,26 @@ function ConvertTo-HmpArgument {
     param([Parameter(Mandatory = $true)][string]$Text)
     if ($Text -notmatch '[\s"]') { return $Text }
     return ('"' + (($Text -replace '\\', '/') -replace '"', '\"') + '"')
+}
+
+# The `chardev-add file,...` command for a row's backend, composed here so the
+# quoting is right in one place.  HMP recognises a quoted string only as the
+# WHOLE of an argument: `path="C:/out dir/x.log"` embedded inside the
+# comma-separated options string does not stop the parser splitting at the
+# space, and QEMU 11 answers "extraneous characters at the end of line" (the
+# Phase 20 review's round 2 probed it against a null backend).  So the entire
+# `file,id=...,path=...` string is what gets quoted.  A comma in the path
+# cannot be carried at all - it ends the option whatever the quoting - and is
+# refused with the reason.
+function New-ChardevAddCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$Id,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    if ($Path.Contains(',')) {
+        throw ("the chardev log path '{0}' contains a comma, which chardev-add's option string cannot carry; name an -OutDir without one" -f $Path)
+    }
+    return ("chardev-add " + (ConvertTo-HmpArgument -Text ("file,id={0},path={1}" -f $Id, $Path)))
 }
 
 # A monitor command whose failure must be LOUD.  hub7bv0.ps1's defect 2: a

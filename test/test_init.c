@@ -39,34 +39,7 @@
  * engine's vocabulary, not the DDK's (batch 6-A: the Win2000 DDK does not
  * define three of the names ReactOS's usbehci uses). */
 #include "../src/xhci_xfer.h"
-
-static int failures;
-static int checks;
-
-#define CHECK(cond, what) check_impl((cond), (what), __LINE__)
-
-static void check_impl(int cond, const char *what, int line)
-{
-    checks++;
-    if (!cond) {
-        failures++;
-        printf("FAIL %s:%d: %s\n", "test_init.c", line, what);
-    }
-}
-
-#define CHECK_EQ(got, want, what) \
-    check_eq_impl((unsigned long)(got), (unsigned long)(want), (what), __LINE__)
-
-static void check_eq_impl(unsigned long got, unsigned long want,
-                          const char *what, int line)
-{
-    checks++;
-    if (got != want) {
-        failures++;
-        printf("FAIL %s:%d: %s (got %lu / 0x%lX, want %lu / 0x%lX)\n",
-               "test_init.c", line, what, got, got, want, want);
-    }
-}
+#include "test_harness.h"
 
 /* ------------------------------------------------------------------ */
 /* A synthetic controller                                              */
@@ -95,9 +68,10 @@ static void check_eq_impl(unsigned long got, unsigned long want,
  * directly.
  *
  * This is not a claim that the fleet looks like this: two of the three qualified
- * controllers report 1.00 (xhciqual/results/) - and since the gate is reach
- * rather than version, **whether either of them advertises FSC is unmeasured**,
- * because xhciqual prints HCCPARAMS1 and not HCCPARAMS2. That is roadmap task
+ * controllers report 1.00 (xhciqual/results/). xhciqual has printed and decoded
+ * HCCPARAMS2 since the 2026-08-22 run, and the E460 reads `HCCPARAMS2 00000000`,
+ * `fsc=0`; the two 2026-07-25 result sets predate that change, so **the P14s
+ * remains unmeasured**. That is roadmap task
  * 12.1's first step.
  */
 #define HC_HCIVERSION       0x0110UL
@@ -530,15 +504,23 @@ static void hw_flush_from_drain(void);
 static void hw_fire_stale_callback(void);
 
 /*
- * A one-shot that delivers a stale async callback from *inside*
- * KeInitializeSpinLock - the single instruction of a restart at which usbport
- * has zeroed the extension, the lock is being created, and the new start's epoch
- * has not been stored. Delivering the callback before or after a start meets a
- * consistent extension and proves nothing about that window; this is the same
- * technique the mid-drain FlushInterrupts vector uses, for the same reason.
+ * A one-shot that delivers a stale async callback in the window between
+ * usbport's zeroing of the extension and `StartController`'s first act - the
+ * point at which the extension has no signatures, no epoch and no state, and
+ * where a callback usbport cannot cancel would land if the timer expired
+ * mid-restart. It fires from `prepare_start_arguments` below, which is the
+ * last thing this harness does before calling into the driver, so the
+ * callback runs with the previous start's context against a zeroed extension.
+ * (An earlier version of this comment said "from inside KeInitializeSpinLock";
+ * the hook has never been there, and the 2026-09-07 audit's G16 corrected it.
+ * The lock the callback does take is the driver's own, which is what
+ * `staleAcquires` asserts.) Delivering the callback before or after a start
+ * meets a consistent extension and proves nothing about that window; this is
+ * the same technique the mid-drain FlushInterrupts vector uses, for the same
+ * reason.
  *
  * On a uniprocessor host this is reentrancy rather than concurrency, but it puts
- * the callback at exactly the instruction boundary an SMP interleaving would.
+ * the callback at exactly the boundary an SMP interleaving would.
  */
 static ULONG staleFireOnLockInit;
 static ULONG staleFiredAtInit;
@@ -572,6 +554,10 @@ static ULONG hwCmdHang;
 static ULONG hwCmdAbortSkipsAborted;
 static ULONG hwCmdStoppedPointerBad;
 static ULONG hwCmdIgnoreAbort;
+/* The stop's reported dequeue pointer names the hung command's OWN TRB rather
+ * than the one after it: the xHC never fetched it, so the abort had nothing to
+ * advance past (the 2026-09-05 audit's F12). */
+static ULONG hwCmdStoppedAtHung;
 /*
  * An abort that stops the ring but whose events are still in flight when the
  * abort watchdog next runs. CRR negates, so the watchdog concludes locally that
@@ -687,6 +673,20 @@ static XHCI_COMMAND_TIMEOUT asyncContext;
 static XHCI_PORT_TIMEOUT asyncPortContext;
 static XHCI_ASYNC_TIMER_CALLBACK *asyncCallback;
 
+/* Opt-in delivery queue: older vectors inspect the last-request views above
+ * and deliver manually. Queue vectors own every captured timer explicitly. */
+#define HC_ASYNC_PENDING_MAX 16
+typedef struct _HC_ASYNC_PENDING {
+    PVOID Extension;
+    XHCI_ASYNC_TIMER_CALLBACK *Callback;
+    ULONG Milliseconds;
+    ULONG Length;
+    ULONG Context[4];
+} HC_ASYNC_PENDING;
+static HC_ASYNC_PENDING asyncPending[HC_ASYNC_PENDING_MAX];
+static ULONG asyncPendingCount;
+static ULONG asyncQueueEnabled;
+
 /* UsbPortInvalidateRootHub - the root hub's announcement (Phase 5 task 5). */
 static ULONG rootHubInvalidates;
 static ULONG rootHubInvalidatesUnderLock;
@@ -788,6 +788,20 @@ static void hc_set_hciversion(ULONG version)
 {
     mmio[XHCI_CAP_CAPLENGTH / 4] = HC_CAPLENGTH | (version << 16);
 }
+
+/*
+ * There is deliberately no `hc_set_caplength`. This model places its
+ * operational registers with the compile-time `HC_OP(x)` = `HC_CAPLENGTH + x`,
+ * so moving CAPLENGTH at run time would move the operational block out from
+ * under every write the model makes and `run_init` would fail for that reason
+ * rather than for the one under test. An earlier comment below promised such
+ * a vector and named this helper; both were wrong, and the 2026-09-07 audit
+ * (G16) removed the promise. The reach gate itself IS tested, directly and
+ * from both sides - a short CAPLENGTH and a short mapped window - in
+ * `test_caps.c`, "FSC, and the two gates on believing HCCPARAMS2", which
+ * calls the decoder without an operational block at all and so can vary
+ * either number freely.
+ */
 
 static void hc_build(void)
 {
@@ -891,6 +905,7 @@ static void hc_build(void)
     hwCmdAbortSkipsAborted = 0;
     hwCmdStoppedPointerBad = 0;
     hwCmdIgnoreAbort = 0;
+    hwCmdStoppedAtHung = 0;
     hwCmdSilentAbort = 0;
     hwCmdCompletionCode = XHCI_CC_SUCCESS;
     hwCmdSlotId = 0;
@@ -909,6 +924,8 @@ static void hc_build(void)
     staleCallback = NULL;
 
     asyncRequests = 0;
+    asyncPendingCount = 0;
+    asyncQueueEnabled = 0;
     asyncMs = 0;
     asyncContextLength = 0;
     asyncArmedUnderLock = 0;
@@ -2017,8 +2034,25 @@ static ULONG NTAPI hc_async_callback(PVOID extension, ULONG milliseconds,
                                      XHCI_ASYNC_TIMER_CALLBACK *callback)
 {
     ULONG i;
+    HC_ASYNC_PENDING *pending;
 
-    (void)extension;
+    if (asyncQueueEnabled) {
+        CHECK(asyncPendingCount < HC_ASYNC_PENDING_MAX,
+              "the async delivery queue must not drop a timer");
+        CHECK(contextLength <= sizeof(asyncPending[0].Context),
+              "the async delivery queue must not truncate a context");
+        if (asyncPendingCount < HC_ASYNC_PENDING_MAX &&
+            contextLength <= sizeof(asyncPending[0].Context)) {
+            pending = &asyncPending[asyncPendingCount++];
+            pending->Extension = extension;
+            pending->Callback = callback;
+            pending->Milliseconds = milliseconds;
+            pending->Length = contextLength;
+            for (i = 0; i < contextLength; i++) {
+                ((UCHAR *)pending->Context)[i] = ((const UCHAR *)context)[i];
+            }
+        }
+    }
 
     asyncRequests++;
     asyncMs = milliseconds;
@@ -2046,6 +2080,24 @@ static ULONG NTAPI hc_async_callback(PVOID extension, ULONG milliseconds,
         ((UCHAR *)&asyncPortContext)[i] = ((const UCHAR *)context)[i];
     }
     return 0;
+}
+
+static void hc_deliver_async(ULONG index)
+{
+    HC_ASYNC_PENDING pending;
+    ULONG i;
+
+    CHECK(index < asyncPendingCount, "deliver an existing async timer");
+    if (index >= asyncPendingCount) {
+        return;
+    }
+    pending = asyncPending[index];
+    asyncPendingCount--;
+    for (i = index; i < asyncPendingCount; i++) {
+        asyncPending[i] = asyncPending[i + 1];
+    }
+    /* Remove before entry: the callback may arm another timer. */
+    pending.Callback(pending.Extension, pending.Context);
 }
 
 /*
@@ -2352,10 +2404,47 @@ static MPSTATUS NTAPI logRegistryValue(PVOID miniPortExtension,
                                        PVOID out,
                                        ULONG outBytes);
 
+/*
+ * **Task 9-A.2's fold partition, as a running net rather than a snapshot.**
+ *
+ * Every reply that reaches the descriptor walk leaves through exactly one of
+ * four exits, so a fifth added later has to fail a check instead of quietly
+ * shrinking the total. Until the 2026-09-07 audit's G12 that identity was
+ * asserted once, at the end of `main`, on whatever the LAST start happened to
+ * leave in `ext` - and the last vector in this file zeroes the extension, so
+ * every operand was zero and the net read 0 == 0. Unlike the open-accounting
+ * and topology nets beside it, it had no "saw something" twin to catch that.
+ *
+ * It now runs immediately before usbport's zeroing below, which is the last
+ * moment a start's counters exist, and accumulates across every start in the
+ * file. The end of `main` asserts the accumulated identity and that the net
+ * both ran and saw folded replies.
+ */
+static ULONG descAccountingChecks;
+static ULONG descAccountingFailures;
+static ULONG descAccountingRepliesSeen;
+static ULONG descAccountingOutcomes;
+
+static void note_desc_accounting(void)
+{
+    ULONG accounted;
+
+    descAccountingChecks++;
+    accounted = ext.DescConfigsCommitted + ext.DescConfigsInactive +
+                ext.DescConfigsPartial + ext.DescConfigsMalformed;
+    if (accounted != ext.DescRepliesFolded) {
+        descAccountingFailures++;
+    }
+    descAccountingRepliesSeen += ext.DescRepliesFolded;
+    descAccountingOutcomes += accounted;
+}
+
 static void prepare_start_arguments(void)
 {
     ULONG i;
     ULONG_PTR aligned;
+
+    note_desc_accounting();
 
     /*
      * usbport's own `RtlZeroMemory(FdoExtension->MiniPortExt, ...)`, which it
@@ -2806,7 +2895,10 @@ static void hw_command_abort(void)
             hw_post_event(XHCI_TRB_TYPE_COMMAND_COMPLETION, hwCmdHungPA,
                           XHCI_CC_COMMAND_ABORTED << 24);
         }
-        hwCmdDequeuePA = hwCmdHungPA + sizeof(XHCI_TRB);
+        /* A command that was executing is advanced past (4.6.1.2 p.93); one
+         * the xHC never fetched stays where the dequeue pointer sits. */
+        hwCmdDequeuePA = hwCmdStoppedAtHung ? hwCmdHungPA
+                                            : hwCmdHungPA + sizeof(XHCI_TRB);
         hwCmdHungPA = 0;
     }
 
@@ -3152,7 +3244,35 @@ static void test_write_order(void)
     int run;
 
     hc_build();
+    /*
+     * USBLEGCTLSTS as firmware may leave it: every RsvdP field set (3:1, 12:5,
+     * 19:17), every SMI enable set, every RW1C status bit set. The handoff's
+     * write must clear the five enables, acknowledge the three status bits,
+     * and carry the RsvdP fields back untouched - the 2026-09-05 audit's F13
+     * found a blanket 0xFFFF enable mask zeroing them.
+     */
+    mmio[HC_LEGACY_OFFSET / 4 + 1] = XHCI_USBLEGCTLSTS_RSVDP |
+                                     XHCI_USBLEGCTLSTS_SMI_ENABLES |
+                                     XHCI_USBLEGCTLSTS_SMI_STATUS;
     CHECK_EQ(run_init(), MP_STATUS_SUCCESS, "the same start, re-run");
+    {
+        int legctl;
+
+        legctl = first_write(HC_LEGACY_OFFSET + 4);
+        CHECK(legctl >= 0, "the handoff writes USBLEGCTLSTS");
+        if (legctl >= 0) {
+            CHECK_EQ(writeValue[legctl] & XHCI_USBLEGCTLSTS_RSVDP,
+                     XHCI_USBLEGCTLSTS_RSVDP,
+                     "preserving the RsvdP fields 3:1, 12:5 and 19:17");
+            CHECK_EQ(writeValue[legctl] & XHCI_USBLEGCTLSTS_SMI_ENABLES, 0,
+                     "clearing the five SMI enables");
+            CHECK_EQ(writeValue[legctl] & XHCI_USBLEGCTLSTS_SMI_STATUS,
+                     XHCI_USBLEGCTLSTS_SMI_STATUS,
+                     "and acknowledging the three RW1C status bits");
+            CHECK_EQ(writeValue[legctl] & 0x1FF00000UL, 0,
+                     "with the RsvdZ 28:21 and read-only 20 left at zero");
+        }
+    }
 
     /*
      * The ownership claim is the first write of any kind. Everything ahead of
@@ -7575,6 +7695,149 @@ static void test_command_timeout(void)
     CHECK_EQ(ext.CommandState, XHCI_CMD_STATE_IDLE, "with the ring in service");
 
     /*
+     * **The stop that still names the abandoned command** (the 2026-09-05
+     * audit's F12). The header's premise - the xHC advanced past the aborted
+     * TRB - holds for a command that was executing; a command doorbelled but
+     * never fetched leaves the dequeue pointer ON it, valid and unexecuted, so
+     * adopting the position as reported would have the next doorbell execute
+     * the abandoned command ahead of the one it was rung for. The TRB has to
+     * be rewritten as a No Op COMMAND (type 23 - the transfer ring's type 8
+     * would be a TRB Error here), its completion retired as the rewrite's
+     * rather than counted unmatched, and the command that follows it must
+     * complete normally.
+     */
+    hc_build();
+    hwCmdHang = 1;
+    hwCmdAbortSkipsAborted = 1;
+    hwCmdStoppedAtHung = 1;
+    CHECK_EQ(run_init(), MP_STATUS_SUCCESS, "(a controller that never fetches)");
+    hw_events_reset();
+    {
+        ULONG hungPA;
+        ULONG hungIndex;
+        ULONG unmatched;
+        ULONG completed;
+
+        hungPA = ext.CommandTrbPA;
+        CHECK(hungPA != 0, "(the self-test No Op is outstanding)");
+        CHECK_EQ(XhciRingIndexFromPA(&ext.CommandRing, hungPA, &hungIndex),
+                 XHCI_RING_OK, "(at an index on the ring)");
+        fire_async_timer();
+        deliver_events();
+        CHECK_EQ(ext.CommandRingStops, 1, "(the ring stopped)");
+        CHECK_EQ(ext.CommandRingStoppedOnAbandoned, 1,
+                 "a stop naming the abandoned command's own TRB is recognised");
+        CHECK_EQ(ext.CommandRingDiverged, 0, "and is not a divergence");
+        CHECK_EQ(XHCI_TRB_GET_TYPE(ext.CommandRing.Base[hungIndex].Control),
+                 XHCI_TRB_TYPE_NOOP_COMMAND,
+                 "the abandoned TRB is rewritten as a No Op Command, type 23");
+        CHECK_EQ(ext.CommandNoOpRewrittenPA, hungPA,
+                 "and remembered for its completion");
+        CHECK_EQ(ext.CommandRing.Dequeue, hungIndex,
+                 "with the dequeue pointer adopted on it");
+        CHECK_EQ(ext.CommandState, XHCI_CMD_STATE_IDLE, "and the ring in service");
+        CHECK_EQ(ext.CommandTrbPA, 0, "(with no command outstanding)");
+
+        /* The next command: the doorbell executes the No Op first, then it. */
+        hwCmdHang = 0;
+        unmatched = ext.CommandsUnmatched;
+        completed = ext.CommandsCompleted;
+        CHECK_EQ(XhciCommandSubmit(&ext, &trb, NULL), XHCI_CMD_OK,
+                 "the next command is accepted");
+        deliver_events();
+        CHECK_EQ(ext.CommandsUnmatched, unmatched,
+                 "the rewritten No Op's completion is not counted unmatched");
+        CHECK_EQ(ext.CommandNoOpRewrittenPA, 0, "and is forgotten once retired");
+        CHECK_EQ(ext.CommandTrbPA, 0, "the next command completed");
+        CHECK_EQ(ext.CommandsCompleted, completed + 1, "and was counted once");
+        CHECK_EQ(ext.CommandState, XHCI_CMD_STATE_IDLE, "leaving the ring idle");
+        CHECK_EQ(ext.CommandRing.Dequeue, ext.CommandRing.Enqueue,
+                 "and empty - both TRBs retired");
+    }
+
+    /*
+     * **The rewrite marker does not outlive the ring** (Phase 20 review,
+     * finding 1). A rewritten No Op still unanswered when the controller is
+     * suspended and resumed - the resume rebuilds the command ring - would
+     * otherwise match the first new command to land at that address and
+     * retire its completion as the No Op's.
+     */
+    hc_build();
+    hwCmdHang = 1;
+    hwCmdAbortSkipsAborted = 1;
+    hwCmdStoppedAtHung = 1;
+    CHECK_EQ(run_init(), MP_STATUS_SUCCESS, "(a controller that never fetches)");
+    hw_events_reset();
+    fire_async_timer();
+    deliver_events();
+    CHECK_EQ(ext.CommandRingStoppedOnAbandoned, 1, "(a rewrite is pending)");
+    CHECK(ext.CommandNoOpRewrittenPA != 0, "(and remembered)");
+    hwCmdHang = 0;
+    hwCmdStoppedAtHung = 0;
+    XhciRegPacket.SuspendController(&ext);
+    /* The reinitialisation carves the event ring afresh at index 0; the
+     * model's producer has to start there too (what enable_start does before
+     * a start, for the same reason). */
+    hw_events_reset();
+    CHECK_EQ(XhciRegPacket.ResumeController(&ext), MP_STATUS_SUCCESS,
+             "(a resume that rebuilds the command ring)");
+    CHECK_EQ(ext.CommandNoOpRewrittenPA, 0,
+             "the rebuilt ring inherits no rewrite marker");
+    deliver_events();               /* the resume's own No Op self-test */
+    {
+        ULONG unmatched;
+
+        unmatched = ext.CommandsUnmatched;
+        CHECK_EQ(XhciCommandSubmit(&ext, &trb, NULL), XHCI_CMD_OK,
+                 "(a command on the rebuilt ring)");
+        deliver_events();
+        CHECK_EQ(ext.CommandTrbPA, 0, "completes as its own");
+        CHECK_EQ(ext.CommandsUnmatched, unmatched, "(and is not misretired)");
+    }
+
+    /*
+     * **A second abandonment behind a pending rewrite is a divergence**
+     * (Phase 20 review, finding 2). The No Op is at the head, still unfetched;
+     * the next command is doorbelled behind it and hangs too; the abort
+     * reports the stop at the No Op's address, so the abandoned command sits
+     * behind it, valid and executable, and one marker cannot track both.
+     */
+    hc_build();
+    hwCmdHang = 1;
+    hwCmdAbortSkipsAborted = 1;
+    hwCmdStoppedAtHung = 1;
+    CHECK_EQ(run_init(), MP_STATUS_SUCCESS, "(a controller that never fetches)");
+    hw_events_reset();
+    fire_async_timer();
+    deliver_events();
+    CHECK_EQ(ext.CommandRingStoppedOnAbandoned, 1, "(a rewrite is pending)");
+    {
+        ULONG diverged;
+
+        diverged = ext.CommandRingDiverged;
+        /* Still hanging: the doorbell for the next command fetches nothing,
+         * so the model's dequeue stays on the No Op. */
+        CHECK_EQ(XhciCommandSubmit(&ext, &trb, NULL), XHCI_CMD_OK,
+                 "(a second command, behind the No Op)");
+        fire_async_timer();             /* its watchdog: abort (writes CA) */
+        writeCount = 0;
+        invalidateCalls = 0;
+        deliver_events();               /* the stop, at the No Op's address */
+        CHECK_EQ(ext.CommandRingDiverged, diverged + 1,
+                 "a second stop with a rewrite still unanswered is a divergence");
+        CHECK_EQ(invalidateCalls, 1, "that asks usbport for a reset");
+        CHECK_EQ(ext.CommandRingStoppedOnAbandoned, 1,
+                 "and does not attempt a second rewrite");
+        CHECK_EQ(ext.CommandState, XHCI_CMD_STATE_ABORTING,
+                 "leaving the engine out of service until the reset");
+        CHECK_EQ(count_writes(HC_OP(XHCI_OP_CRCR)), 0,
+                 "and rewriting nothing");
+    }
+    hwCmdHang = 0;
+    hwCmdAbortSkipsAborted = 0;
+    hwCmdStoppedAtHung = 0;
+
+    /*
      * A Command Ring Stopped naming a position this ring cannot hold. The
      * obvious repair - rewrite CRCR, which is legal exactly here - **cannot be
      * expressed**: the Command Ring Pointer is bits 63:6 ("the low order 6 bits
@@ -7962,7 +8225,8 @@ static void test_command_restart_epoch(void)
      * finished, where the extension is consistent and the epoch already differs.
      * The window the epoch is actually racing is narrower: the moment usbport has
      * zeroed the extension and the new start is creating the lock. Deliver it
-     * there, from inside KeInitializeSpinLock itself.
+     * there: `prepare_start_arguments` fires it immediately before the
+     * driver is entered, with the extension zeroed.
      *
      * What rejects it there is the signature, which usbport's zeroing has just
      * erased and StartController has not yet written. It reaches that conclusion
@@ -14408,6 +14672,406 @@ static void test_slot_ep0_remove_superseded_handle_late(void)
                                           &slotSgList),
              MP_STATUS_SUCCESS, "a further submit through the live handle is accepted");
     CHECK_EQ(ext.TransfersRefused, refusals, "and nothing was refused for retry");
+}
+
+/*
+ * **The 2026-09-05 audit's F1: a handle is not a binding.** Three sequences
+ * driven through the real callbacks reached the replacement handle's state
+ * through a superseded one - a non-default REMOVE unbound the replacement, an
+ * EP0 PAUSED paused the live pipe, a submit through a closed EP0 handle queued
+ * work on the live device. The three vectors below are those sequences, each
+ * followed by the replacement handle still working, plus the record-reuse form
+ * the audit's second pass named: a released record is reused for the next
+ * device, so a stale handle resolves to a record that belongs to someone else.
+ * The identity test is `xhciEpHandleSuperseded` - bound to a *different*
+ * extension, so an unbound record between a REMOVE and its reopen keeps its
+ * answers (`test_slot_quiesce_refusals` pins the reset-pipe in that window) -
+ * and what it deliberately does NOT gate is AbortTransfer, which matches the
+ * transfer rather than the handle.
+ *
+ * None of these sequences has been observed from a supported usbport stack -
+ * issue 4's run had only EP0 open on the restored device - and the third probe
+ * submits through a handle usbport has already been told is closed. They are
+ * callback-entry contracts, pinned so the identity rule cannot regress, not
+ * observed traffic.
+ */
+static void test_slot_stale_handle_interrupt_endpoint(void)
+{
+    PXHCI_DEVICE dev;
+    PXHCI_ENDPOINT_RECORD record;
+    ULONG removesWithWork;
+    ULONG completions;
+    ULONG stale;
+
+    dev = slot_enumerate_addressed(3, 3, 5, 7);
+    CHECK_EQ(slot_open_ep(&slotEndpoint2, 7, UsbHighSpeed, 0x81,
+                          USBPORT_TRANSFER_TYPE_INTERRUPT, 8, 8, 1),
+             MP_STATUS_SUCCESS, "(the interrupt endpoint opens into handle A)");
+    deliver_events();
+    record = &dev->Endpoints[0];
+    CHECK_EQ(record->State, XHCI_EP_REC_CONFIGURED, "(and is configured)");
+    CHECK(record->EndpointExtension == (PVOID)&slotEndpoint2, "(bound to A)");
+
+    /* The same endpoint opened again through a second extension: the record is
+     * rebound to B while A still believes itself open. */
+    CHECK_EQ(slot_open_ep(&slotEndpoint3, 7, UsbHighSpeed, 0x81,
+                          USBPORT_TRANSFER_TYPE_INTERRUPT, 8, 8, 1),
+             MP_STATUS_SUCCESS, "the same endpoint opens into handle B");
+    CHECK(record->EndpointExtension == (PVOID)&slotEndpoint3,
+          "and the record is bound to B");
+    CHECK_EQ(slotEndpoint2.Flags & XHCI_ENDPOINT_FLAG_OPEN,
+             XHCI_ENDPOINT_FLAG_OPEN, "(while A still believes itself open)");
+
+    /* Probe 1: the REMOVE of the superseded handle. */
+    removesWithWork = ext.RemovesWithWork;
+    XhciRegPacket.SetEndpointState(&ext, &slotEndpoint2, USBPORT_ENDPOINT_REMOVE);
+    CHECK_EQ(ext.EndpointRemovesSuperseded, 1,
+             "a REMOVE through A is counted as superseded");
+    CHECK_EQ(slotEndpoint2.Flags & XHCI_ENDPOINT_FLAG_OPEN, 0, "and closes A");
+    CHECK(record->EndpointExtension == (PVOID)&slotEndpoint3,
+          "but the record stays bound to B");
+    CHECK_EQ(record->State, XHCI_EP_REC_CONFIGURED, "still configured");
+    CHECK_EQ(record->Dci, 3, "with its record intact");
+    CHECK_EQ(dev->ActiveOp, XHCI_DEV_OP_NONE, "and no teardown of B's queue started");
+    CHECK_EQ(ext.RemovesWithWork, removesWithWork,
+             "(B's queue was not the REMOVE's subject)");
+
+    /* Probe 2's non-default form: PAUSED and the status calls through A. */
+    stale = ext.EndpointCallsStale;
+    XhciRegPacket.SetEndpointState(&ext, &slotEndpoint2, USBPORT_ENDPOINT_PAUSED);
+    CHECK_EQ(record->Quiesce.Flags & XHCI_EPQ_PAUSED, 0,
+             "a PAUSED through A does not pause B's endpoint");
+    CHECK_EQ(ext.EndpointCallsStale, stale + 1, "and is counted stale");
+    CHECK_EQ(XhciRegPacket.GetEndpointStatus(&ext, &slotEndpoint2),
+             USBPORT_ENDPOINT_RUN, "a status query through A answers RUN");
+    CHECK_EQ(ext.EndpointCallsStale, stale + 2, "and is counted stale");
+    XhciRegPacket.SetEndpointStatus(&ext, &slotEndpoint2, USBPORT_ENDPOINT_RUN);
+    CHECK_EQ(ext.EndpointCallsStale, stale + 3, "as is a reset-pipe through A");
+    CHECK_EQ(dev->ActiveOp, XHCI_DEV_OP_NONE, "which resets nothing on B's pipe");
+
+    /* Probe 3's non-default form: a submit through the closed A is failed, not
+     * queued on B and not refused for retry. */
+    completions = completeTransferCalls;
+    slot_setup_xfer(&slotParams, &slotTransfer, &slotSgList, 8, 1);
+    CHECK_EQ(XhciRegPacket.SubmitTransfer(&ext, &slotEndpoint2, &slotParams,
+                                          &slotTransfer, &slotSgList),
+             MP_STATUS_SUCCESS, "a submit through A is accepted to be answered");
+    CHECK_EQ(ext.TransfersFailedStale, 1, "and failed as stale");
+    CHECK_EQ(record->Queue.Count, 0, "never reaching B's queue");
+    deliver_events();
+    CHECK_EQ(completeTransferCalls, completions + 1,
+             "and completed back to usbport");
+    CHECK(lastCompletedStatus != 0, "as cancelled");
+
+    /* B is unaffected by all of it. */
+    slot_setup_xfer(&slotParams2, &slotTransfer2, &slotSgList2, 8, 1);
+    CHECK_EQ(XhciRegPacket.SubmitTransfer(&ext, &slotEndpoint3, &slotParams2,
+                                          &slotTransfer2, &slotSgList2),
+             MP_STATUS_SUCCESS, "a submit through B is accepted");
+    CHECK_EQ(record->Queue.Count, 1, "and queued");
+    CHECK_EQ(ext.TransfersFailedStale, 1, "(not failed)");
+
+    /* And B's own REMOVE is the ordinary path, finding the work it queued. */
+    XhciRegPacket.SetEndpointState(&ext, &slotEndpoint3, USBPORT_ENDPOINT_REMOVE);
+    CHECK_EQ(ext.EndpointRemovesSuperseded, 1,
+             "a REMOVE of the bound handle is not counted as superseded");
+    CHECK_EQ(record->EndpointExtension, NULL, "and drops the binding");
+    CHECK_EQ(ext.RemovesWithWork, removesWithWork + 1,
+             "counting the work it found queued");
+}
+
+/*
+ * The one call a superseded handle keeps (Phase 20 review, finding 3): a
+ * PAUSED from a handle that still owns queued work. A same-parameter reopen
+ * rebinds the record to B without draining what A queued, and usbport cancels
+ * A's transfers through A - PAUSED first, AbortTransfer after - so declining
+ * that PAUSED would remove the early Stop Endpoint that keeps the abort's DMA
+ * window narrow. Once the work is gone, A's PAUSED is declined like any other
+ * superseded call.
+ */
+static void test_slot_stale_handle_owning_work_may_pause(void)
+{
+    PXHCI_DEVICE dev;
+    PXHCI_ENDPOINT_RECORD record;
+    ULONG stale;
+
+    dev = slot_enumerate_addressed(3, 3, 5, 7);
+    CHECK_EQ(slot_open_ep(&slotEndpoint2, 7, UsbHighSpeed, 0x81,
+                          USBPORT_TRANSFER_TYPE_INTERRUPT, 8, 8, 1),
+             MP_STATUS_SUCCESS, "(the interrupt endpoint opens into handle A)");
+    deliver_events();
+    record = &dev->Endpoints[0];
+    slot_setup_xfer(&slotParams, &slotTransfer, &slotSgList, 8, 1);
+    CHECK_EQ(XhciRegPacket.SubmitTransfer(&ext, &slotEndpoint2, &slotParams,
+                                          &slotTransfer, &slotSgList),
+             MP_STATUS_SUCCESS, "(A queues a transfer)");
+    CHECK_EQ(record->Queue.Count, 1, "(one outstanding)");
+
+    CHECK_EQ(slot_open_ep(&slotEndpoint3, 7, UsbHighSpeed, 0x81,
+                          USBPORT_TRANSFER_TYPE_INTERRUPT, 8, 8, 1),
+             MP_STATUS_SUCCESS, "the same endpoint opens into handle B");
+    CHECK(record->EndpointExtension == (PVOID)&slotEndpoint3, "(bound to B)");
+    CHECK_EQ(record->Queue.Count, 1, "with A's transfer still queued");
+
+    /* usbport cancels A's transfer: PAUSED through A must still start the
+     * stop, because A owns work on that queue. */
+    stale = ext.EndpointCallsStale;
+    XhciRegPacket.SetEndpointState(&ext, &slotEndpoint2, USBPORT_ENDPOINT_PAUSED);
+    CHECK_EQ(record->Quiesce.Flags & XHCI_EPQ_PAUSED, XHCI_EPQ_PAUSED,
+             "a PAUSED through a superseded handle that owns queued work pauses");
+    CHECK_EQ(ext.EndpointCallsStale, stale, "and is not counted stale");
+    CHECK_EQ(dev->ActiveOp, XHCI_DEV_OP_STOP_EP,
+             "so the Stop Endpoint starts before the abort, as the contract wants");
+
+    {
+        ULONG length;
+
+        length = 0;
+        XhciRegPacket.AbortTransfer(&ext, &slotEndpoint2, &slotTransfer, &length);
+    }
+    CHECK_EQ(record->Queue.Count, 0, "the abort withdraws A's transfer");
+    /* The stop, then the placement the reposition owes; driven until the
+     * chain is quiet rather than by a fixed count. */
+    for (stale = 0; stale < 6 && dev->ActiveOp != XHCI_DEV_OP_NONE; stale++) {
+        deliver_events();
+    }
+    CHECK_EQ(dev->ActiveOp, XHCI_DEV_OP_NONE, "(the quiesce chain completed)");
+
+    /* With nothing of A's left on the queue, A is just a superseded handle. */
+    stale = ext.EndpointCallsStale;
+    XhciRegPacket.SetEndpointState(&ext, &slotEndpoint2, USBPORT_ENDPOINT_PAUSED);
+    CHECK_EQ(ext.EndpointCallsStale, stale + 1,
+             "a PAUSED through A with no work of A's left is declined");
+    XhciRegPacket.SetEndpointState(&ext, &slotEndpoint2, USBPORT_ENDPOINT_ACTIVE);
+    CHECK_EQ(ext.EndpointCallsStale, stale + 2, "as is an ACTIVE through A");
+    CHECK_EQ(record->Quiesce.Flags & XHCI_EPQ_PAUSED, XHCI_EPQ_PAUSED,
+             "so the endpoint stays paused - until the health poll's restart "
+             "(XHCI_EP_RESTART_MS; test_slot_paused_endpoint_is_restarted_by_"
+             "the_poll pins that backstop) or an ACTIVE through the bound "
+             "handle, which is what B sends here");
+    XhciRegPacket.SetEndpointState(&ext, &slotEndpoint3, USBPORT_ENDPOINT_ACTIVE);
+    CHECK_EQ(record->Quiesce.Flags & XHCI_EPQ_PAUSED, 0,
+             "an ACTIVE through B ends the pause");
+    CHECK_EQ(record->State, XHCI_EP_REC_CONFIGURED, "(still configured)");
+
+    /* B carries on. */
+    slot_setup_xfer(&slotParams2, &slotTransfer2, &slotSgList2, 8, 1);
+    CHECK_EQ(XhciRegPacket.SubmitTransfer(&ext, &slotEndpoint3, &slotParams2,
+                                          &slotTransfer2, &slotSgList2),
+             MP_STATUS_SUCCESS, "a submit through B is accepted");
+    CHECK_EQ(record->Queue.Count, 1, "and queued");
+}
+
+static void test_slot_stale_handle_ep0(void)
+{
+    PXHCI_DEVICE dev;
+    ULONG completions;
+    ULONG stale;
+    ULONG refusals;
+    ULONG i;
+
+    /* The two-handle restore, carried through to the new handle's address. */
+    dev = slot_enumerate_addressed(3, 3, 5, 2);
+    slot_reset_port(3);
+    slot_properties(0, UsbHighSpeed, 64);
+    for (i = 0; i < sizeof(slotEndpointRestore) / sizeof(ULONG); i++) {
+        ((ULONG *)&slotEndpointRestore)[i] = 0;
+    }
+    CHECK_EQ(open_endpoint_now(&slotEndpointRestore), MP_STATUS_SUCCESS,
+             "(EP0 opens at address 0 through a second handle)");
+    deliver_events();
+    slot_setup(0x00, 0x05, 3, 0);
+    (void)XhciRegPacket.SubmitTransfer(&ext, &slotEndpointRestore, &slotParams,
+                                       &slotTransfer, &slotSgList);
+    deliver_events();
+    CHECK_EQ(dev->State, XHCI_DEV_STATE_ADDRESSED, "(addressed at 3)");
+    CHECK(dev->EndpointExtension == (PVOID)&slotEndpointRestore,
+          "(bound to the new handle)");
+
+    /* Probe 2: PAUSED through the old handle, still open, must not pause the
+     * live EP0; neither status call may reach it either. */
+    stale = ext.EndpointCallsStale;
+    XhciRegPacket.SetEndpointState(&ext, &slotEndpoint, USBPORT_ENDPOINT_PAUSED);
+    CHECK_EQ(dev->Ep0Quiesce.Flags & XHCI_EPQ_PAUSED, 0,
+             "a PAUSED through the old handle does not pause the live EP0");
+    CHECK_EQ(ext.EndpointCallsStale, stale + 1, "and is counted stale");
+    CHECK_EQ(XhciRegPacket.GetEndpointStatus(&ext, &slotEndpoint),
+             USBPORT_ENDPOINT_RUN, "a status query through it answers RUN");
+    XhciRegPacket.SetEndpointStatus(&ext, &slotEndpoint, USBPORT_ENDPOINT_RUN);
+    CHECK_EQ(ext.EndpointCallsStale, stale + 3, "both counted stale");
+    CHECK_EQ(dev->ActiveOp, XHCI_DEV_OP_NONE, "and nothing issued for them");
+
+    /* Probe 3: the old handle is removed (issue 4's path), then a submit
+     * arrives through it anyway. */
+    XhciRegPacket.SetEndpointState(&ext, &slotEndpoint, USBPORT_ENDPOINT_REMOVE);
+    CHECK_EQ(ext.Ep0RemovesSuperseded, 1, "(the old handle's REMOVE is superseded)");
+    CHECK_EQ(dev->Flags & XHCI_DEV_FLAG_EP0_OPEN, XHCI_DEV_FLAG_EP0_OPEN,
+             "(and the record stays open through the new one)");
+    completions = completeTransferCalls;
+    refusals = ext.TransfersRefused;
+    slot_setup(0x80, 0x06, 0x0100, 0);
+    CHECK_EQ(XhciRegPacket.SubmitTransfer(&ext, &slotEndpoint, &slotParams,
+                                          &slotTransfer, &slotSgList),
+             MP_STATUS_SUCCESS,
+             "a submit through the closed old handle is accepted to be answered");
+    CHECK_EQ(ext.TransfersFailedStale, 1, "and failed as stale");
+    CHECK_EQ(dev->Ep0Queue.Count, 0, "never reaching the live EP0 queue");
+    CHECK_EQ(ext.TransfersRefused, refusals, "and not refused for retry");
+    deliver_events();
+    CHECK_EQ(completeTransferCalls, completions + 1, "completed back to usbport");
+    CHECK(lastCompletedStatus != 0, "as cancelled");
+
+    /* The live handle carries on. */
+    slot_setup(0x80, 0x06, 0x0100, 0);
+    CHECK_EQ(XhciRegPacket.SubmitTransfer(&ext, &slotEndpointRestore, &slotParams,
+                                          &slotTransfer2, &slotSgList),
+             MP_STATUS_SUCCESS, "a submit through the live handle is accepted");
+    CHECK_EQ(dev->Ep0Queue.Count, 1, "and queued");
+    CHECK_EQ(ext.TransfersFailedStale, 1, "(not failed)");
+}
+
+static void test_slot_stale_handle_after_record_reuse(void)
+{
+    PXHCI_DEVICE dev;
+    PXHCI_ENDPOINT_RECORD record;
+    ULONG completions;
+    ULONG stale;
+    ULONG i;
+
+    /* A device with an interrupt endpoint in handle A, then unplugged: the
+     * Disable Slot completes and its record is released. */
+    dev = slot_enumerate_addressed(3, 3, 5, 7);
+    CHECK_EQ(slot_open_ep(&slotEndpoint2, 7, UsbHighSpeed, 0x81,
+                          USBPORT_TRANSFER_TYPE_INTERRUPT, 8, 8, 1),
+             MP_STATUS_SUCCESS, "(the first device's interrupt endpoint, handle A)");
+    deliver_events();
+    CHECK(dev == &ext.Devices[0], "(record 0)");
+    CHECK_EQ(slotEndpoint2.DeviceIndex, 1, "(A names record 0)");
+    slot_detach(3);
+    for (i = 0; i < 8 && ext.Devices[0].State != XHCI_DEV_STATE_FREE; i++) {
+        deliver_events();
+    }
+    CHECK_EQ(ext.Devices[0].State, XHCI_DEV_STATE_FREE, "the record is released");
+
+    /* The next device takes the same record, and opens the same DCI into B.
+     * Attached without restarting the controller, so this is reuse rather than
+     * a fresh table. */
+    hwCmdSlotId = 6;
+    slot_attach(3, 3);
+    CHECK_EQ(slot_open(0, UsbHighSpeed, 64), MP_STATUS_SUCCESS,
+             "(a second device on the same port)");
+    deliver_events();
+    deliver_events();
+    dev = &ext.Devices[0];
+    CHECK_EQ(dev->State, XHCI_DEV_STATE_DEFAULT, "(reusing record 0)");
+    slot_setup(0x00, 0x05, 9, 0);
+    (void)XhciRegPacket.SubmitTransfer(&ext, &slotEndpoint, &slotParams,
+                                       &slotTransfer, &slotSgList);
+    deliver_events();
+    CHECK_EQ(dev->State, XHCI_DEV_STATE_ADDRESSED, "(addressed at 9)");
+    CHECK_EQ(slot_open_ep(&slotEndpoint3, 9, UsbHighSpeed, 0x81,
+                          USBPORT_TRANSFER_TYPE_INTERRUPT, 8, 8, 1),
+             MP_STATUS_SUCCESS, "(its interrupt endpoint, handle B, same DCI)");
+    deliver_events();
+    record = &dev->Endpoints[0];
+    CHECK_EQ(record->Dci, 3, "(at the DCI A still names)");
+    CHECK(record->EndpointExtension == (PVOID)&slotEndpoint3, "(bound to B)");
+    CHECK_EQ(slotEndpoint3.DeviceIndex, slotEndpoint2.DeviceIndex,
+             "(B and A resolve to the same record)");
+
+    /* A, which belonged to the device that left, must reach nothing of B's. */
+    completions = completeTransferCalls;
+    slot_setup_xfer(&slotParams, &slotTransfer, &slotSgList, 8, 1);
+    CHECK_EQ(XhciRegPacket.SubmitTransfer(&ext, &slotEndpoint2, &slotParams,
+                                          &slotTransfer, &slotSgList),
+             MP_STATUS_SUCCESS, "a submit through A is accepted to be answered");
+    CHECK_EQ(ext.TransfersFailedStale, 1, "and failed as stale");
+    CHECK_EQ(record->Queue.Count, 0, "never reaching B's queue");
+    deliver_events();
+    CHECK_EQ(completeTransferCalls, completions + 1, "completed as cancelled");
+    stale = ext.EndpointCallsStale;
+    XhciRegPacket.SetEndpointState(&ext, &slotEndpoint2, USBPORT_ENDPOINT_PAUSED);
+    CHECK_EQ(record->Quiesce.Flags & XHCI_EPQ_PAUSED, 0,
+             "a PAUSED through A does not pause B's endpoint");
+    CHECK_EQ(ext.EndpointCallsStale, stale + 1, "and is counted stale");
+    XhciRegPacket.SetEndpointState(&ext, &slotEndpoint2, USBPORT_ENDPOINT_REMOVE);
+    CHECK_EQ(ext.EndpointRemovesSuperseded, 1,
+             "a REMOVE through A is counted as superseded");
+    CHECK(record->EndpointExtension == (PVOID)&slotEndpoint3,
+          "and B stays bound");
+    CHECK_EQ(record->State, XHCI_EP_REC_CONFIGURED, "and configured");
+
+    slot_setup_xfer(&slotParams2, &slotTransfer2, &slotSgList2, 8, 1);
+    CHECK_EQ(XhciRegPacket.SubmitTransfer(&ext, &slotEndpoint3, &slotParams2,
+                                          &slotTransfer2, &slotSgList2),
+             MP_STATUS_SUCCESS, "a submit through B is accepted");
+    CHECK_EQ(record->Queue.Count, 1, "and queued");
+}
+
+/*
+ * **The 2026-09-05 audit's F8: the device-table reset is one locked
+ * transition, and the active drainer keeps its guard.** A single-threaded
+ * suite cannot interleave a second CPU, so what is pinned is the contract's
+ * observable half: the table is wholly zero afterwards (a callback that reads
+ * it sees the old table or this), no nested acquisition happened while the
+ * reset ran under the lock, a set `DeferredBusy` - an active drainer inside its
+ * unlocked interval - survives the reset, and the work the reset cancelled is
+ * delivered by the drain rather than lost with the table.
+ */
+static void test_slot_init_resets_the_table_in_one_hold(void)
+{
+    PXHCI_DEVICE dev;
+    ULONG completions;
+    ULONG lockErrors;
+    ULONG nonZero;
+    ULONG i;
+
+    dev = slot_enumerate_addressed(3, 3, 5, 7);
+    CHECK_EQ(slot_open_ep(&slotEndpoint2, 7, UsbHighSpeed, 0x81,
+                          USBPORT_TRANSFER_TYPE_INTERRUPT, 8, 8, 1),
+             MP_STATUS_SUCCESS, "(an interrupt endpoint)");
+    deliver_events();
+    slot_setup(0x80, 0x06, 0x0100, 0);
+    (void)XhciRegPacket.SubmitTransfer(&ext, &slotEndpoint, &slotParams,
+                                       &slotTransfer, &slotSgList);
+    CHECK_EQ(dev->Ep0Queue.Count, 1, "(with a transfer queued on EP0)");
+    /* What a callback on another CPU may have written into a record just
+     * before the reset: quiesce state a lockless zeroing could have left
+     * behind on a FREE record. */
+    dev->Ep0Quiesce.Flags |= XHCI_EPQ_FAILED | XHCI_EPQ_UNAVAILABLE;
+
+    ext.DeferredBusy = 1;           /* an active drainer, mid-service call */
+    completions = completeTransferCalls;
+    lockErrors = commandLockErrorsTotal;
+    XhciSlotInit(&ext);
+    CHECK_EQ(commandLockErrorsTotal, lockErrors,
+             "the reset took the lock once, with nothing nested under it");
+
+    nonZero = 0;
+    for (i = 0; i < XHCI_MAX_SLOTS * (sizeof(XHCI_DEVICE) / sizeof(ULONG)); i++) {
+        if (((ULONG *)ext.Devices)[i] != 0) {
+            nonZero++;
+        }
+    }
+    CHECK_EQ(nonZero, 0, "every word of the device table is zero afterwards");
+    CHECK_EQ(ext.Devices[0].Ep0Quiesce.Flags, 0,
+             "including the quiesce state written into it beforehand");
+    CHECK_EQ(ext.CommandOwner, 0, "the command owner is cleared");
+    CHECK_EQ(ext.PumpCursor, 0, "and the pump cursor");
+    CHECK_EQ(ext.EndpointInvalidatesOwed, 0, "and the invalidation total");
+    CHECK_EQ(ext.DeferredBusy, 1,
+             "the active drainer's ownership of the drain survives the reset");
+    CHECK_EQ(completeTransferCalls, completions,
+             "(and nothing was completed under it)");
+
+    /* The drainer returns from its service call and finishes; the cancelled
+     * transfer is what it delivers. */
+    ext.DeferredBusy = 0;
+    XhciSlotDeferredWork(&ext);
+    CHECK_EQ(completeTransferCalls, completions + 1,
+             "the work the reset cancelled is delivered by the drain");
+    CHECK(lastCompletedStatus != 0, "as cancelled");
+    CHECK_EQ(ext.DeferredBusy, 0, "and the drain is free again");
 }
 
 /*
@@ -21481,6 +22145,49 @@ static void test_slot_fail_record_stops_before_draining(void)
     CHECK_EQ(record->Queue.Count, 0, "the queue drains at that moment");
 }
 
+/* A failed record keeps its address for teardown, not for another EP0 open. */
+static void test_slot_failed_record_ep0_reopen(void)
+{
+    PXHCI_DEVICE dev;
+    ULONG i;
+    ULONG refusals;
+    ULONG commands;
+    ULONG wanted;
+
+    dev = slot_enumerate_addressed(3, 3, 5, 7);
+    XhciRegPacket.SetEndpointState(&ext, &slotEndpoint,
+                                   USBPORT_ENDPOINT_REMOVE);
+    XhciRegPacket.CheckController(&ext);
+    for (i = 0; i < (XHCI_DEV_STALL_MS / 500UL) + 1UL; i++) {
+        slot_setup(0x80, 0x06, 0x0100, 0);
+        (void)XhciRegPacket.SubmitTransfer(&ext, &slotEndpoint, &slotParams,
+                                           &slotTransfer, &slotSgList);
+        poll_after_ms(500UL);
+    }
+    CHECK_EQ(dev->State, XHCI_DEV_STATE_FAILED, "(progress detector failed it)");
+    CHECK(dev->Flags & XHCI_DEV_FLAG_ADDRESS_VALID,
+          "(the failed record still owns its address)");
+    refusals = ext.OpenRefusals;
+    commands = hwCmdExecuted;
+    wanted = dev->WantedMaxPacketSize0;
+    for (i = 0; i < 2; i++) {
+        slot_properties(7, UsbHighSpeed, i ? 32 : dev->MaxPacketSize0);
+        CHECK_EQ(open_endpoint_now(&slotEndpointRestore),
+                 MP_STATUS_NO_RESOURCES, "a failed record refuses EP0 open");
+        CHECK_EQ(reopen_endpoint_now(&slotEndpoint),
+                 MP_STATUS_NO_RESOURCES, "a failed record refuses EP0 reopen");
+        CHECK_EQ(dev->State, XHCI_DEV_STATE_FAILED, "the record stays failed");
+        CHECK_EQ(dev->PendingOp, XHCI_DEV_OP_NONE, "no Evaluate MPS is queued");
+        CHECK_EQ(dev->WantedMaxPacketSize0, wanted, "no MPS change is retained");
+        CHECK(dev->EndpointExtension == NULL, "no failed binding is replaced");
+        CHECK((dev->Flags & XHCI_DEV_FLAG_EP0_OPEN) == 0, "EP0 stays closed");
+    }
+    CHECK_EQ(ext.OpenRefusals, refusals + 4, "every refused open is counted");
+    CHECK_EQ(hwCmdExecuted, commands, "no command reached the controller");
+    CHECK(dev->Flags & XHCI_DEV_FLAG_ADDRESS_VALID,
+          "the address is retained for the existing disown path");
+}
+
 /*
  * The tenth review's surviving mutations, each given the vector it exposed.
  * Grouped here rather than scattered because what they have in common is the
@@ -25986,9 +26693,12 @@ static void test_save_restore(void)
     CHECK_EQ(dev->State, XHCI_DEV_STATE_DEFAULT, "(a device in Default)");
 
     reinits = ext.ResumeReinits;
+    mmio[HC_IR0(XHCI_IR_IMOD) / 4] = 4000UL;   /* the reset default, F10 below */
     XhciRegPacket.SuspendController(&ext);
     CHECK_EQ(ext.SavedStateValid, 1, "the save succeeded");
     CHECK_EQ(ext.SaveFailures, 0, "with no failure recorded");
+    CHECK_EQ(ext.SavedImod, 4000UL, "and captured IMOD as it read");
+    mmio[HC_IR0(XHCI_IR_IMOD) / 4] = 0;        /* what a restore has to undo */
 
     CHECK_EQ(XhciRegPacket.ResumeController(&ext), MP_STATUS_SUCCESS,
              "and the resume restores");
@@ -26002,6 +26712,18 @@ static void test_save_restore(void)
              "and the controller running again");
     CHECK_EQ(ext.SavedStateValid, 0,
              "the saved state is consumed - a restore is a one-shot");
+    /*
+     * The 2026-09-05 audit's F10: the restore wrote IMOD as 0, so a controller
+     * that restored successfully ran with no interrupt moderation while the
+     * isochronous builder's IOC-per-TD policy assumed the 1 ms default. The
+     * value the save read (set to the reset default here, because the model's
+     * IMOD is otherwise 0 and a check against 0 would pass for the wrong
+     * reason) is what the restore has to write back.
+     */
+    CHECK_EQ(mmio[HC_IR0(XHCI_IR_IMOD) / 4], 4000UL,
+             "the restore writes IMOD back as the save read it, not as 0");
+
+    /* --- restored, but the controller will not start. A restore that
 
     /* --- restored, but the controller will not start. A restore that
      * reprogrammed every register and then did not run is a failed resume. --- */
@@ -26131,8 +26853,15 @@ static void test_save_restore(void)
     CHECK_EQ(ext.SavesDeclinedNoFsc, 0, "so nothing is declined for it");
     CHECK_EQ(ext.SavedStateValid, 1, "and the state is saved");
 
-    /* And a controller whose CAPLENGTH stops before HCCPARAMS2 has no bit to
-     * read, whatever its version, so it declines. */
+    /*
+     * The control, and the whole of what this file can say about the reach
+     * gate: the default model's CAPLENGTH (20h) does reach HCCPARAMS2, so the
+     * bit is read and believed. A controller whose CAPLENGTH stops before
+     * HCCPARAMS2 has no bit to read whatever its version, and that half is in
+     * `test_caps.c` rather than here, for the reason given at
+     * `hc_set_hciversion` above: this model's operational registers are
+     * placed at a compile-time offset from CAPLENGTH and cannot follow it.
+     */
     hc_build();
     CHECK_EQ(run_init(), MP_STATUS_SUCCESS, "(a 1.1 controller)");
     CHECK_EQ(ext.HcInfo.Fsc, 1UL, "declares FSC when the register is reachable");
@@ -27905,6 +28634,328 @@ static void test_registered_unexercised_callbacks(void)
     CHECK_EQ(ext.Flags, flags, "and none of the seven moved lifecycle state");
 }
 
+/*
+ * A fatal status after a completed in-place recovery escalates again.
+ *
+ * Measured on the SMP guest on 2026-09-06 (roadmap task 20.7): the first HCE
+ * provoked from outside the guest recovered cleanly, and the next three were
+ * never escalated - ControllerFatal, the transition latch, was set once and
+ * nothing reopened it, although HCRST had cleared the bit it answered. The
+ * controller would have stayed dead until a reboot, the state the recovery
+ * exists to close. The reinitialization now clears the latch with
+ * ControllerFailed.
+ */
+static void test_fatal_after_recovery(void)
+{
+    ULONG fatalBefore;
+
+    hc_build();
+    CHECK_EQ(run_init(), MP_STATUS_SUCCESS, "(a healthy start)");
+    XhciRegPacket.EnableInterrupts(&ext);
+    hw_events_reset();
+    invalidateCalls = 0;
+    fatalBefore = ext.FatalStatusDetected;
+
+    /* The first fatal report, as the health poll sees it. */
+    mmio[HC_OP(XHCI_OP_USBSTS) / 4] |= XHCI_USBSTS_HCE;
+    XhciRegPacket.CheckController(&ext);
+    CHECK_EQ(ext.FatalStatusDetected, fatalBefore + 1, "HCE escalates");
+    CHECK_EQ(invalidateCalls, 1, "and asks usbport for a reset");
+    CHECK_EQ(ext.ControllerFatal, 1, "the transition latch closes");
+
+    /* usbport answers with ResetController, the poll arms the recovery, and
+     * the callback reinitializes through HCRST, which clears HCE. */
+    asyncCallback = NULL;
+    asyncRequests = 0;
+    XhciRegPacket.ResetController(&ext);
+    CHECK_EQ(ext.ControllerFailed, 1, "the controller is latched failed");
+    XhciRegPacket.CheckController(&ext);
+    CHECK_EQ(asyncRequests, 1, "the poll arms the recovery");
+    CHECK_EQ(ext.ControllerFatal, 1,
+             "and the latch stands while the recovery is pending - the poll "
+             "does not reopen it, the reinitialization does");
+
+    /* A recovery that refuses BEFORE its HCRST is written (the halt never
+     * proves HCHalted) leaves the latch standing, and the bit it answered is
+     * still set: nothing has reset the controller. */
+    refuseHalt = 1;
+    fire_async_timer();
+    refuseHalt = 0;
+    CHECK_EQ(ext.RecoveryFailures, 1, "the reinitialization refused at the halt");
+    CHECK_EQ(ext.InitStep, XHCI_INIT_STEP_HALT, "before the HCRST");
+    CHECK_EQ(mmio[HC_OP(XHCI_OP_USBSTS) / 4] & XHCI_USBSTS_HCE, XHCI_USBSTS_HCE,
+             "so HCE is still set - no HCRST was written");
+    CHECK_EQ(ext.RecoveryFailuresConsecutive, 1, "charged to the budget");
+    CHECK_EQ(ext.ControllerFailed, 1, "the controller stays failed");
+    CHECK_EQ(ext.ControllerFatal, 1, "and the fatal latch stays closed");
+
+    /* A recovery that refuses AFTER its HCRST has completed but before the
+     * latch clear: the reset has cleared HCE (the mock's HCRST leaves USBSTS
+     * at HCH, as hardware does) and CNR is held, so the post-reset wait
+     * times out. The latch still stands: it reopens at the clear, not at the
+     * reset. */
+    XhciRegPacket.CheckController(&ext);
+    CHECK_EQ(asyncRequests, 2, "the poll re-arms after the first refusal");
+    cnrHeld = 1;
+    fire_async_timer();
+    cnrHeld = 0;
+    CHECK_EQ(ext.RecoveryFailures, 2, "the reinitialization refused at reset");
+    CHECK_EQ(ext.InitStep, XHCI_INIT_STEP_RESET, "at the CNR wait");
+    CHECK_EQ(mmio[HC_OP(XHCI_OP_USBSTS) / 4] & XHCI_USBSTS_HCE, 0,
+             "HCRST did land and cleared HCE");
+    CHECK_EQ(ext.RecoveryFailuresConsecutive, 2, "the second failure in a row");
+    CHECK_EQ(ext.ControllerFailed, 1, "the controller stays failed");
+    CHECK_EQ(ext.ControllerFatal, 1,
+             "and the fatal latch stays closed - it reopens only at the clear "
+             "past HCRST, which this sequence never reached");
+
+    /* The poll arms again within the budget; this time the sequence
+     * completes. */
+    XhciRegPacket.CheckController(&ext);
+    CHECK_EQ(asyncRequests, 3, "the poll re-arms after the second refusal");
+    fire_async_timer();
+    CHECK_EQ(ext.RecoveryCompletions, 1, "the recovery completed");
+    CHECK_EQ(ext.RecoveryFailuresConsecutive, 0,
+             "and the run of failures ends with it");
+    CHECK_EQ(ext.ControllerFailed, 0, "the failed latch is open");
+    CHECK_EQ(mmio[HC_OP(XHCI_OP_USBSTS) / 4] & XHCI_USBSTS_HCE, 0,
+             "HCRST cleared the bit the fatal latch answered");
+    CHECK_EQ(ext.ControllerFatal, 0,
+             "so the fatal latch is open too - the next report is a new "
+             "transition, not a repetition of the one already answered");
+
+    /* A clean poll in between is not a fault. */
+    invalidateCalls = 0;
+    XhciRegPacket.CheckController(&ext);
+    CHECK_EQ(invalidateCalls, 0,
+             "a clean USBSTS after the recovery is not escalated");
+
+    /* The second fatal, after the recovery: escalated again. */
+    mmio[HC_OP(XHCI_OP_USBSTS) / 4] |= XHCI_USBSTS_HCE;
+    XhciRegPacket.CheckController(&ext);
+    CHECK_EQ(ext.FatalStatusDetected, fatalBefore + 2,
+             "a second HCE after a completed recovery is detected");
+    CHECK_EQ(invalidateCalls, 1, "and asks usbport for a reset again");
+    CHECK_EQ(ext.ControllerFatal, 1, "and the latch closes again, once");
+    XhciRegPacket.CheckController(&ext);
+    CHECK_EQ(invalidateCalls, 1,
+             "a poll that still sees the bit does not ask a second time");
+
+    /* And a refusal AFTER the clear - at the run, past HCRST and the
+     * capability recheck - leaves the fatal latch open and re-latches
+     * ControllerFailed against the budget: the bit the latch answered is
+     * gone, so a fatal after this refusal would be a new transition. */
+    asyncRequests = 0;
+    XhciRegPacket.ResetController(&ext);
+    XhciRegPacket.CheckController(&ext);
+    CHECK_EQ(asyncRequests, 1, "the poll arms the second recovery");
+    refuseRun = 1;
+    fire_async_timer();
+    refuseRun = 0;
+    CHECK_EQ(ext.RecoveryFailures, 3, "the reinitialization refused at the run");
+    CHECK_EQ(ext.InitStep, XHCI_INIT_STEP_RUN, "past the clear");
+    CHECK_EQ(ext.ControllerFailed, 1, "ControllerFailed is re-latched");
+    CHECK_EQ(ext.RecoveryFailuresConsecutive, 1,
+             "and charged to a new run of failures");
+    CHECK_EQ(mmio[HC_OP(XHCI_OP_USBSTS) / 4] & XHCI_USBSTS_HCE, 0,
+             "HCRST cleared the bit");
+    CHECK_EQ(ext.ControllerFatal, 0,
+             "and the fatal latch is open: it was cleared past HCRST, before "
+             "the step that refused");
+    XhciRegPacket.CheckController(&ext);
+    CHECK_EQ(asyncRequests, 2, "the poll re-arms within the budget");
+    fire_async_timer();
+    CHECK_EQ(ext.RecoveryCompletions, 2, "and the next attempt completes");
+    CHECK_EQ(ext.ControllerFailed, 0, "with the failed latch open");
+    CHECK_EQ(ext.ControllerFatal, 0, "and the fatal latch still open");
+}
+
+/*
+ * **The 2026-09-05 audit's F2: a lost delivery is aged out, a late callback is
+ * declined, and repeated loss is bounded.** `UsbPortRequestAsyncCallback`
+ * answers 0 on its own pool-allocation failure as well as on success, so an
+ * arming that produced no callback is invisible at the call - and the audit's
+ * model (arm once, discard the callback, poll a hundred times) read
+ * `armed=1 requested=0 attempts=0`, stable: the attempts are counted only when
+ * a recovery runs, so the loss cost no attempt and the cap never bounded it.
+ * The repair ages the arming on the health poll, the one clock that keeps
+ * running while `ControllerFailed` is set, stamps every arming with a
+ * generation so the lost callback is declined if it turns up after all, and
+ * charges the loss to the consecutive count so repeated loss ends where a
+ * refusing controller does.
+ */
+static void test_recovery_delivery_loss(void)
+{
+    XHCI_COMMAND_TIMEOUT lost;
+    XHCI_ASYNC_TIMER_CALLBACK *lostCallback;
+    HW_ACCESS_SNAPSHOT before;
+    ULONG round;
+    ULONG i;
+
+    /* --- one arming, whose callback the service silently failed to queue --- */
+    hc_build();
+    CHECK_EQ(run_init(), MP_STATUS_SUCCESS, "(a controller that starts)");
+    ext.ControllerFailed = 1;
+    ext.RecoveryRequested = 1;
+    asyncRequests = 0;
+    XhciRegPacket.CheckController(&ext);
+    CHECK_EQ(ext.RecoveryArmed, 1, "(one recovery armed against the latch)");
+    CHECK_EQ(asyncRequests, 1, "(through one service call)");
+    CHECK(asyncContext.Generation != 0, "the arming carries a delivery generation");
+    CHECK_EQ(asyncContext.Generation, ext.RecoveryGeneration,
+             "which is the current one");
+    lost = asyncContext;
+    lostCallback = asyncCallback;
+    asyncCallback = NULL;               /* the allocation failed: no callback exists */
+
+    /* Short of the bound: still armed, nothing declared, nothing re-armed. */
+    for (i = 0; i + 1 < XHCI_RECOVERY_DELIVERY_POLLS; i++) {
+        XhciRegPacket.CheckController(&ext);
+    }
+    CHECK_EQ(ext.RecoveryArmed, 1, "the arming stands short of the bound");
+    CHECK_EQ(ext.RecoveryArmedPolls, XHCI_RECOVERY_DELIVERY_POLLS - 1,
+             "aged by the polls that found it out");
+    CHECK_EQ(ext.RecoveryDeliveriesLost, 0, "with nothing declared lost");
+    CHECK_EQ(asyncRequests, 1, "and nothing re-armed");
+
+    /* The bounding poll: lost, charged, re-requested and re-armed, in one. */
+    XhciRegPacket.CheckController(&ext);
+    CHECK_EQ(ext.RecoveryDeliveriesLost, 1,
+             "at the bound the delivery is declared lost");
+    CHECK_EQ(ext.RecoveryFailuresConsecutive, 1,
+             "and charged to the consecutive count the cap reads");
+    CHECK_EQ(ext.RecoveryAttempts, 0, "(no recovery ran to count it)");
+    CHECK_EQ(asyncRequests, 2, "and the same poll arms the next generation");
+    CHECK_EQ(ext.RecoveryArmed, 1, "which stands");
+    CHECK_EQ(ext.RecoveryRequested, 0, "consuming the re-request");
+    CHECK(asyncContext.Generation != lost.Generation,
+          "with a generation the lost arming does not share");
+    CHECK_EQ(ext.RecoveryArmedPolls, 0, "and an age of its own");
+
+    /* The lost callback arrives after all: late, and declined. */
+    hw_access_snapshot(&before);
+    if (lostCallback != NULL) {
+        lostCallback(&ext, &lost);
+    }
+    check_touched_nothing(&before, "a recovery callback from an aged-out arming");
+    CHECK_EQ(ext.RecoveryCallbacksLate, 1,
+             "a callback from the aged-out arming is counted late");
+    CHECK_EQ(ext.RecoveryAttempts, 0, "and recovers nothing");
+    CHECK_EQ(ext.RecoveryArmed, 1,
+             "and does not release the arming that belongs to the next one");
+    CHECK_EQ(ext.ControllerFailed, 1, "(the latch stands)");
+
+    /* The next generation is delivered: one recovery, the charge cleared. */
+    fire_async_timer();
+    CHECK_EQ(ext.RecoveryAttempts, 1, "the re-armed generation recovers");
+    CHECK_EQ(ext.RecoveryCompletions, 1, "and brings the controller back");
+    CHECK_EQ(ext.ControllerFailed, 0, "(the latch is open)");
+    CHECK_EQ(ext.RecoveryFailuresConsecutive, 0,
+             "and a success clears what the loss charged");
+    CHECK_EQ(ext.RecoveryArmed, 0, "with nothing left armed");
+    deliver_events();
+
+    /* --- repeated loss reaches the terminal state the cap describes --- */
+    hc_build();
+    CHECK_EQ(run_init(), MP_STATUS_SUCCESS, "(a controller that starts)");
+    ext.ControllerFailed = 1;
+    ext.RecoveryRequested = 1;
+    asyncRequests = 0;
+    for (round = 0; round < XHCI_RECOVERY_MAX_ATTEMPTS; round++) {
+        XhciRegPacket.CheckController(&ext);
+        asyncCallback = NULL;           /* every arming is lost */
+        for (i = 0; i < XHCI_RECOVERY_DELIVERY_POLLS; i++) {
+            XhciRegPacket.CheckController(&ext);
+        }
+    }
+    CHECK_EQ(ext.RecoveryDeliveriesLost, XHCI_RECOVERY_MAX_ATTEMPTS,
+             "each lost arming is counted");
+    CHECK_EQ(ext.RecoveryFailuresConsecutive, XHCI_RECOVERY_MAX_ATTEMPTS,
+             "and charged, up to the cap");
+    CHECK_EQ(asyncRequests, XHCI_RECOVERY_MAX_ATTEMPTS,
+             "so exactly the cap's worth of armings were made");
+    CHECK_EQ(ext.RecoveryArmed, 0, "and after the last loss nothing is armed");
+    CHECK_EQ(ext.RecoveryRequested, 1,
+             "the request stands, measured, with nothing arming it");
+    CHECK_EQ(ext.ControllerFailed, 1, "and the controller is left latched");
+    for (i = 0; i < 5; i++) {
+        XhciRegPacket.CheckController(&ext);
+    }
+    CHECK_EQ(asyncRequests, XHCI_RECOVERY_MAX_ATTEMPTS,
+             "further polls arm nothing - the terminal state is terminal");
+    CHECK_EQ(ext.RecoveryDeliveriesLost, XHCI_RECOVERY_MAX_ATTEMPTS,
+             "and declare nothing more lost");
+
+    /* --- a suspend between the arming and its delivery does not age it --- */
+    hc_build();
+    CHECK_EQ(run_init(), MP_STATUS_SUCCESS, "(a controller that starts)");
+    asyncQueueEnabled = 1;
+    ext.ControllerFailed = 1;
+    ext.RecoveryRequested = 1;
+    asyncRequests = 0;
+    XhciRegPacket.CheckController(&ext);
+    CHECK_EQ(ext.RecoveryArmed, 1, "(one recovery armed against the latch)");
+    CHECK_EQ(asyncPendingCount, 1, "the recovery timer is queued");
+    XhciRegPacket.SuspendController(&ext);
+    for (i = 0; i < XHCI_RECOVERY_DELIVERY_POLLS + 2; i++) {
+        XhciRegPacket.CheckController(&ext);
+    }
+    CHECK_EQ(ext.RecoveryArmed, 1,
+             "polls while SUSPENDED do not age the arming");
+    CHECK_EQ(ext.RecoveryArmedPolls, 0, "(its age does not move)");
+    CHECK_EQ(ext.RecoveryDeliveriesLost, 0, "and declare nothing lost");
+    CHECK_EQ(asyncRequests, 1, "nor arm another");
+    CHECK_EQ(XhciRegPacket.ResumeController(&ext), MP_STATUS_SUCCESS,
+             "(the resume brings the controller back)");
+    CHECK_EQ(ext.ControllerFailed, 0, "(its reinitialisation clears the latch)");
+    CHECK(asyncPendingCount >= 2, "resume also queued a command watchdog");
+    /*
+     * A reinitialising resume does NOT move the start epoch (only
+     * XhciCommandInit does, from StartController), so the recovery callback
+     * still matches when it arrives: it finds the latch clear, counts itself
+     * stale, and releases the arming itself. Deliver the newer watchdog first
+     * to show it cannot overwrite or consume the older recovery callback.
+     */
+    while (asyncPendingCount > 1) {
+        hc_deliver_async(asyncPendingCount - 1);
+    }
+    CHECK_EQ(ext.RecoveryArmed, 1, "watchdogs cannot consume the recovery timer");
+    hc_deliver_async(0);
+    CHECK_EQ(asyncPendingCount, 0, "both timer families were delivered");
+    asyncQueueEnabled = 0;
+    CHECK_EQ(ext.RecoveryAttempts, 0,
+             "the recovery callback recovers nothing on a controller the "
+             "resume already brought back");
+    CHECK_EQ(ext.RecoveryStaleCallbacks, 1, "and counts itself stale");
+    CHECK_EQ(ext.RecoveryArmed, 0, "and releases its arming");
+    CHECK_EQ(ext.RecoveryRequested, 0,
+             "handing nothing back, because nothing is owed");
+    CHECK_EQ(ext.RecoveryDeliveriesLost, 0, "(nothing was lost)");
+
+    /*
+     * The age-out's uncharged branch, for the arming that outlives its
+     * purpose AND whose callback never comes: the latch cleared by another
+     * path while the arming was out, and the delivery lost as well. Produced
+     * directly, because no single sequence of callbacks reaches it; what is
+     * pinned is that a healthy controller's budget is not charged for it.
+     */
+    ext.RecoveryArmed = 1;
+    ext.RecoveryArmedPolls = 0;
+    for (i = 0; i < XHCI_RECOVERY_DELIVERY_POLLS; i++) {
+        XhciRegPacket.CheckController(&ext);
+    }
+    CHECK_EQ(ext.RecoveryArmed, 0,
+             "an arming aged out with the latch clear is retired");
+    CHECK_EQ(ext.RecoveryStaleCallbacks, 2,
+             "counted with the callbacks that had nothing to do");
+    CHECK_EQ(ext.RecoveryDeliveriesLost, 0, "not as a lost delivery");
+    CHECK_EQ(ext.RecoveryFailuresConsecutive, 0,
+             "and charging a healthy controller's budget nothing");
+    CHECK_EQ(ext.RecoveryRequested, 0,
+             "with no recovery re-requested and so nothing re-armed");
+    deliver_events();
+}
+
 int main(void)
 {
     /*
@@ -27960,7 +29011,9 @@ int main(void)
     test_health_poll();
     test_command_event_validation();
     test_reset_controller();
+    test_recovery_delivery_loss();
     test_controller_recovery();
+    test_fatal_after_recovery();
     test_bad_signature_bodies();
     test_registered_start_stop();
     test_registered_callbacks();
@@ -27999,6 +29052,11 @@ int main(void)
     test_slot_endpoint_remove();
     test_slot_ep0_remove_superseded_handle();
     test_slot_ep0_remove_superseded_handle_late();
+    test_slot_stale_handle_interrupt_endpoint();
+    test_slot_stale_handle_owning_work_may_pause();
+    test_slot_stale_handle_ep0();
+    test_slot_stale_handle_after_record_reuse();
+    test_slot_init_resets_the_table_in_one_hold();
     test_slot_port_disable_teardown();
     test_slot_port_disable_waits_for_the_port();
     test_slot_queue_counter_fold();
@@ -28075,6 +29133,7 @@ int main(void)
     test_slot_suppressed_reset_is_bounded();
     test_slot_refusal_is_bounded();
     test_slot_fail_record_stops_before_draining();
+    test_slot_failed_record_ep0_reopen();
     test_probe_transfer_shapes();
     test_probe_gates();
     test_probe_endpoint_contract();
@@ -28252,16 +29311,17 @@ int main(void)
 
     /*
      * Task 9-A.2's fold partition, asserted rather than described (review round
-     * 2): every reply that reached the walk left through exactly one of four
-     * exits, so a fifth added later fails a check instead of quietly shrinking
-     * the total. It is a net over the *last* start's counters, which is enough -
-     * the identity is per controller and every vector that folds a reply runs
-     * inside one.
+     * 2), over every start in the file rather than only the last one. See
+     * `note_desc_accounting`.
      */
-    CHECK_EQ(ext.DescConfigsCommitted + ext.DescConfigsInactive +
-                 ext.DescConfigsPartial + ext.DescConfigsMalformed,
-             ext.DescRepliesFolded,
+    note_desc_accounting();
+    CHECK_EQ(descAccountingFailures, 0,
              "every folded descriptor reply left through exactly one outcome");
+    CHECK_EQ(descAccountingOutcomes, descAccountingRepliesSeen,
+             "and the two totals agree across every start");
+    CHECK(descAccountingChecks > 0, "the descriptor accounting net actually ran");
+    CHECK(descAccountingRepliesSeen > 0,
+          "and saw folded replies while it did");
 
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures;

@@ -34,9 +34,9 @@ Every USB 3.x connector (USB4/Thunderbolt included) also carries the USB 2.0 wir
 
 The driver needs a USB 2.0 stack (`usbport.sys` + `usbhub20.sys`) on the machine first:
 
-- **Windows 98 SE**: Either install [NUSB 3.3 or 3.6](https://www.philscomputerlab.com/windows-98-usb-storage-driver.html) or the [SweetLow's stack](http://sweetlow.orgfree.com/download/usb20_win9x.zip). For SweetLow's stack, unzip, right-click the `USB2.INF` at its root, install, reboot.
+- **Windows 98 SE**: Either install [NUSB 3.3 or 3.6](https://www.philscomputerlab.com/windows-98-usb-storage-driver.html) or the [SweetLow's stack](http://sweetlow.orgfree.com/download/usb20_win9x.zip). For SweetLow's stack, unzip, right-click the `USB2.INF` at its root then install. Reboot if requested after installing the USB 2.0 stack.
 - **Windows ME**: Use [SweetLow's stack](http://sweetlow.orgfree.com/download/usb20_win9x.zip) only.
-- **Windows 2000 SP4 and XP SP3 (32-bit)**: Nothing to install; SP4 has the stack (or use the standalone USB 2.0 update KB319973).
+- **Windows 2000 SP4 and XP SP3 (32-bit)**: Nothing to install, both OSes at their service pack level already have the stack.
 
 On an xHCI-only Windows 98 SE or ME machine, **have the Windows installation CD at hand** or the contents on disk as the driver needs some files from there.
 
@@ -62,6 +62,7 @@ XHCIQUAL demo video: https://www.youtube.com/watch?v=Tv6blmBS6Do
 2. In Device Manager, find the unrecognised xHCI controller. It sits unclaimed with a yellow mark, usually under "Other devices" such as "Universal Serial Bus Controller".
 3. Properties -> Driver -> Update Driver -> Specify a location/Have Disk -> the `release\` directory.
 4. It installs as "USB 2.0 eXtensible Host Controller (xhci98)" with a "USB Root Hub" underneath it, and neither should carry a warning mark.
+5. Reboot if requested.
 
 <img src="images/xhci98-driver-info.jpg" width="800">
 
@@ -105,11 +106,20 @@ The devices checked so far, all on the E460 under Windows 98 SE. Each is charact
 | Sound Blaster Play! 3, C-Media USB Audio Device (UAC 1.0) | `041E:324D`, `0D8C:0014` | Full | Enumerate and are named by the wizard. Found the Full-Speed `bMaxPacketSize0` bug. |
 | Sound Blaster X4 (UAC 2.0, `bInterval` 3 and 4) | `041E:3278` | High | Enumerates but does not bind on Windows 98 (one HID devnode at Code 10, no composite parent), so its `bInterval > 1` endpoints were never exercised. |
 
-One known defect is plugging and unplugging a device repeatedly and quickly. Windows 98 at a rate of roughly twice a second sustained can freeze the machine. Ordinary plugging and unplugging is fine.
-
 <img src="images/xhci98-flash-speed-test.jpg" width="800">
 
 ATTO Disk Benchmark on the P14s against the MSSU10-128GSR flash drive trasferring around 18 MB/s read and write from 32 KB transfers upward. The USB 3.0 drive runs at USB 2.0 speed on this driver.
+
+## Known limitations
+
+The important limitations. The full list is under "Known limitations" in [release-notes.md](docs/using/release-notes.md).
+
+| Limitation | Detail |
+|---|---|
+| Disabling, uninstalling or upgrading an NUSB driver crashes the machine | A defect in NUSB's `usbport.sys` which cannot stop a running controller. Rename the existing `XHCI98.SYS`, reboot, then remove it. |
+| Every device on a root port is reported as High Speed | Reporting the true speed of a slower device crashes usbport as there is no companion controller. A mouse or keyboard on a root port therefore polls at 1, 2 or 4 ms only. If this is an issue for you, put your lower-speed device behind a hub to allow the true speed to be reported. |
+| `DisableSelectiveSuspend = 1` is written machine-wide | A suspended xHCI controller cannot see a newly plugged device. A driver uninstall does not remove the value. |
+| Fast, repeated plug and unplug can freeze Windows 98 | About twice a second sustained. Ordinary use is fine. |
 
 ## Toolchain and building
 
@@ -143,14 +153,14 @@ The driver is C (C89/C90, no C++ or CRT), built and verified on Windows 11 x64. 
 
 4. Build the two tools that ship beside the driver. `xhciqual\build.cmd` produces `XHCIQUAL.EXE`, the DOS qualifier, and needs [Open Watcom 2.0](https://github.com/open-watcom/open-watcom-v2/releases) at `C:\WATCOM` (or wherever `WATCOM` points). That is the only tool installed normally on the host, and the driver never uses it. `xhcisnap\build.cmd` produces `XHCISNAP.EXE`, the snapshot reader, with the in-repo MSVC 6.0.
 
-5. Make install media. A `.sys` on its own is not install media; the INF travels with it, and since 1.0.0.1 nothing else does, because the INF has Windows supply its own `usbd.sys` and `usbhub.sys` (and, on Windows 2000 and XP, `usbport.sys`). For a Windows 98 SE target, first download NUSB 3.3 (`nusb33e.exe`) from [philscomputerlab.com](https://www.philscomputerlab.com/windows-98-usb-storage-driver.html) to `tools\nusb33e.exe`.
+5. Make install media. A `.sys` on its own is not install media; the INF travels with it, and since 1.0.0.1 nothing else does, because the INF has Windows supply its own `usbd.sys` and `usbhub.sys` (since 1.0.1.0, `usbport.sys` on Windows 2000 and XP; since 1.0.2.0, `usbui.dll` on all four). For a Windows 98 SE target, first download NUSB 3.3 (`nusb33e.exe`) from [philscomputerlab.com](https://www.philscomputerlab.com/windows-98-usb-storage-driver.html) to `tools\nusb33e.exe`.
 
    | Script | Output |
    |---|---|
    | `scripts\package\make-package.ps1` | `out\pkg-<flavour>\` - media a VM or a machine can be pointed at |
    | `scripts\package\make-release.ps1` | `releases\<version>\` and `out\xhci98-<version>.zip` - the published cut |
 
-6. Test in QEMU with the `qemu-xhci` device: a Win98 SE guest, a Win2000 SP4 guest, and an SMP Win2000 guest for race detection. The Windows 2000 guest needs SP4 (or the standalone USB 2.0 update KB319973) and no NUSB.
+6. Test in QEMU with the `qemu-xhci` device: a Win98 SE guest, a Win2000 SP4 guest, and an SMP Win2000 guest for race detection.
 
 The version lives in [src/xhci_version.h](src/xhci_version.h). The INF's `DriverVer` is a literal that the build's INF gate checks against it. See [docs/contributing/build-and-test.md](docs/contributing/build-and-test.md) for the VM setup, versioning, packaging and the rest of the procedure.
 
@@ -237,6 +247,6 @@ The repository tracks no third-party binary on its own, although the two tool ex
 
 * `XHCISNAP.EXE` embeds the MSVC 6.0 runtime.
 
-Each ships with a `NOTICE.TXT` recording it, and the `LICENSE` scope note states their terms.
+Each ships with a `NOTICE.TXT` recording it, and the `LICENSE` scope note says that those runtimes carry their own terms and are outside the grant. Neither quotes the terms themselves.
 
 The full inventory, provenance methods and redistribution boundaries are in [docs/contributing/legal-provenance.md](docs/contributing/legal-provenance.md), which states facts, not legal conclusions.

@@ -3,19 +3,24 @@
 Publish a built driver into releases\<version>\{release,debug}\.
 
 .DESCRIPTION
-`releases\` is the tracked, published half of packaging. Of the files the INF
-names it carries only the two that are this project's own work - `xhci98.sys`
-and `xhci98.inf` - which is why it is a separate step from `make-package.ps1`
-rather than an option on it: the rest are Microsoft's. See `releases\README.md`
-for that split and what it costs an installer.
+`releases\` is the tracked, published half of packaging. It carries the two
+files that are this project's own work - `xhci98.sys` and `xhci98.inf` - and
+since release 1.0.0.1 those are the only files on the media at all: the INF has
+the operating system supply `usbd.sys` and `usbhub.sys` from its own install
+source through `LayoutFile`, joined by `usbport.sys` on the NT path in 1.0.1.0
+and by `usbui.dll` on every path in 1.0.2.0.
+It is a
+separate step from `make-package.ps1` because the package is the gated build
+output and the release is the tracked, written-once record of it. See
+`releases\README.md`.
 
 **The upload set is the other output, and it is not the tracked one.** It
 is the published tree, zipped: `out\upload-<version>\` and
 `out\xhci98-<version>.zip` under the git-ignored `out\`, the directory a
 workspace and the zip the GitHub release asset, which is why only the second
 is named after the project. Since release 1.0.0.1 it carries no Microsoft
-file: the INF has the operating system supply `usbd.sys` and `usbhub.sys`
-from its own install source (`docs\contributing\legal-provenance.md` section
+file: the INF has the operating system supply `usbd.sys`, `usbhub.sys` and
+`usbui.dll` from its own install source (`docs\contributing\legal-provenance.md` section
 5 records the decision and what it withdrew). It is still assembled here
 rather than by hand, because the layout is checked - every flavour directory
 is gated as the install media it is, nothing the INF does not name goes up -
@@ -125,6 +130,14 @@ end up having been called by the same version.
 Passed through to make-package.ps1 for a host with no extracted target binaries
 staged.
 
+.PARAMETER AllowUnstampedDriver
+Publish a driver binary that has no `xhci98.srcstamp` beside it, so nothing has
+checked the published bytes against `src\`. `scripts\build-driver.cmd` writes
+that stamp, so the only binary this applies to is one built before the stamp
+existed - where rebuilding to acquire one would move the PE link timestamp and
+invalidate every reading already taken on these exact bytes. Without this the
+cut refuses; a stamp that MISMATCHES is refused either way.
+
 .PARAMETER SnapToolDir
 Where `XHCISNAP.EXE` is built. Defaults to `xhcisnap\` in the repository. It is
 staged into `releases\<version>\xhcisnap\`, beside the DOS qualifier's own
@@ -157,30 +170,40 @@ Where the upload set is assembled. Defaults to `out\` in the repository, which
 is git-ignored; the asset is generated output and stays out of the tree.
 
 .PARAMETER UploadSetOnly
-Assemble the upload set from what is already on disk - the tracked
-`releases\<version>\` tree and the gated `out\pkg-<flavour>\` directories - and
-publish nothing. Nothing is built, nothing is written under `releases\`, and
-the build-side gates - the host suite, the import gate, the binary's version
-resource - do not run again: this mode never touches a binary, so there is
-nothing for them to answer about. The **INF gate does** run, once per assembled
-flavour directory, because that one is about the media rather than the build -
-see the note under the assembly itself.
+Assemble the upload set from the tracked `releases\<version>\` tree alone, and
+publish nothing. Nothing is built, nothing is read from `out\`, nothing is
+written under `releases\`, and the build-side gates - the host suite, the
+import gate, the binary's version resource - do not run again: this mode never
+touches a binary, so there is nothing for them to answer about. The **INF gate
+does** run, once per assembled flavour directory, because that one is about the
+media rather than the build - see the note under the assembly itself. A fresh
+clone with no `out\` at all can therefore rebuild the current cut's asset.
 
 **This exists so that a broken or lost upload asset is not a reason to re-cut a
 release.** The upload set is assembled after the publish, so without this mode
-the only scripted way to produce it again is `-Force`, which rebuilds
-non-reproducible binaries and rewrites a written-once version directory - the
-one thing `releases\README.md` says never to do. That trap fired for real: the
+the only scripted way to produce it again is `-Force`, which rewrites a
+written-once version directory - the one thing `releases\README.md` says never
+to do. (`-Force` does not rebuild anything: it stages from the existing
+`src\objfre` / `src\objchk` trees and every gate still runs, so the binaries
+come through byte-identical. What it skips is the single "this version
+directory already exists" refusal.) That trap fired for real: the
 first cut's asset was malformed and there was no way to rebuild it in place.
 
-What the build-side gates are replaced by is one check: the `xhci98.sys` and
-`xhci98.inf` in each `pkg-<flavour>\` directory must be byte-identical to the
-published ones. A package that matches the release by hash is the package that
-release was cut from; one that does not is some other build, and is refused.
+**It rebuilds the current cut's asset only.** The INF gate it runs encodes the
+current release's rules, and an older cut fails the rules added since it was
+cut (measured read-only on 2026-09-05: the 1.0.0.1 INF fails six of them, all
+added by 1.0.1.0). A `-Version` other than `src\xhci98.inf`'s `DriverVer` is
+refused with that reason; to rebuild an older cut's asset, check out the commit
+that cut it and run this mode there, where the gate is the one that cut passed.
+roadmap Phase 20, F15 has the record. Until that fix this mode also required
+`out\pkg-<flavour>\` to hash-match the published binaries, a dependency left
+over from when the media carried files the package supplied; since 1.0.0.1
+nothing from the package enters the asset, and the check is gone.
 
 .PARAMETER PackageRoot
-Where the gated `pkg-<flavour>\` directories are. Defaults to `out\` in the
-repository, which is where `make-package.ps1` writes them.
+Where the gated `pkg-<flavour>\` directories are read from and written to by an
+ordinary cut. Defaults to `out\` in the repository, which is where
+`make-package.ps1` writes them. Not read under `-UploadSetOnly`.
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File scripts\package\make-release.ps1
@@ -207,7 +230,8 @@ param(
     [switch]$UploadSetOnly,
     [string]$PackageRoot = "",
     [switch]$Force,
-    [switch]$NoTargetEvidence
+    [switch]$NoTargetEvidence,
+    [switch]$AllowUnstampedDriver
 )
 
 $ErrorActionPreference = "Stop"
@@ -254,6 +278,57 @@ if ($SnapToolDir -eq "") { $SnapToolDir = Join-Path $repo "xhcisnap" }
 $versionHeader = Join-Path $repo "src\xhci_version.h"
 if ($PackageRoot -eq "") { $PackageRoot = Join-Path $repo "out" }
 if ($UploadDir -eq "") { $UploadDir = Join-Path $repo "out" }
+
+function Write-GeneratedText {
+    <#
+    Every plain-text file this script generates goes through here, and there
+    are five of them: the top-level readme.txt and a readme.txt plus a
+    NOTICE.TXT beside each of the two DOS tools.  Until the 2026-09-07 audit
+    only the first was checked, and the other four were written straight out
+    with `Write-AsciiFile`; four of them were shipping 79-column lines.
+
+    TWO GATES, BOTH OF THEM CHEAP AND BOTH OF THEM CAUGHT SOMETHING.
+
+    78 columns.  These are read in Windows 98 Notepad and DOS EDIT, where a
+    longer line wraps in the wrong place.  Widths are not fixed at authoring
+    time either: names, sizes and hashes are substituted in, so a line's
+    width depends on the manifest, and the first substitution overran by
+    nine characters on the day it was written.
+
+    ASCII.  `Write-AsciiFile` turns any non-ASCII byte into a question mark
+    SILENTLY, and the top-level readme embeds `history.md`, which is
+    markdown a person edits.  One typographic dash in a release entry would
+    ship as `?` in a file nobody re-reads after generating it.
+    `make-11v-media.ps1` already refuses non-ASCII for its INF rewrite; this
+    is the same rule for the same reason.
+    #>
+    param(
+        [string]$Path,
+        [string[]]$Lines
+    )
+
+    $name = Split-Path -Leaf $Path
+
+    $overLong = @($Lines | Where-Object { $_.Length -gt 78 })
+    if ($overLong.Count -gt 0) {
+        throw ("{0} has {1} line(s) past 78 columns, the first being:`n{2}" -f `
+               $name, $overLong.Count, $overLong[0])
+    }
+
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $line = $Lines[$i]
+        for ($c = 0; $c -lt $line.Length; $c++) {
+            $code = [int][char]$line[$c]
+            if ($code -lt 0x20 -or $code -gt 0x7E) {
+                if ($code -eq 9) { continue }
+                throw ("{0} line {1} column {2} is not printable ASCII (U+{3:X4}); Write-AsciiFile would replace it with a question mark. The line reads:`n{4}" -f `
+                       $name, ($i + 1), ($c + 1), $code, $line)
+            }
+        }
+    }
+
+    Write-AsciiFile -Path $Path -Lines $Lines
+}
 
 function Resolve-DirectoryArgument {
     # **A directory parameter is made absolute here, and relative means the
@@ -635,12 +710,44 @@ half-done.
 "@
 }
 
+function Get-UploadSetPaths {
+    # The two things the assembly writes under -UploadDir, named in one place
+    # so that the early containment check and the assembly itself cannot
+    # disagree about what is about to be written where.
+    #
+    # **The archive is not named after the directory it is assembled from**,
+    # and the two names differ on purpose (project owner). `upload-` is a
+    # workspace name inside the git-ignored `out\`; the `.zip` is what a
+    # stranger downloads from a GitHub release and finds in their Downloads
+    # folder, where `upload-0.0.0.5.zip` says nothing about what project it
+    # belongs to. The archive carries no top-level directory - every entry is
+    # written relative to the upload root - so this name is the only thing the
+    # download says about itself until it is unpacked.
+    param([string]$UploadDir, [string]$Version)
+    return [pscustomobject]@{
+        Root = Join-Path $UploadDir ("upload-" + $Version)
+        Zip  = Join-Path $UploadDir ("xhci98-" + $Version + ".zip")
+    }
+}
+
 function Assert-UploadSetOutsideRelease {
-    # **The upload set may not be assembled inside the tree it is assembled
-    # from, and may not contain it.** The assembly deletes its own destination
-    # before copying, so an -UploadDir at or below `releases\<version>\` would
-    # delete a directory inside a written-once release and then copy that
-    # release into its own descendant.
+    # **Nothing the assembly writes may land inside `releases\`, and the
+    # upload directory may not contain it either.** The assembly deletes and
+    # recreates `upload-<version>\` and overwrites `xhci98-<version>.zip`, so
+    # either of them at or below `releases\` would write inside a tree whose
+    # every version directory is written once and never edited.
+    #
+    # **The whole `releases\` root is protected, not just the version being
+    # cut.** The first version of this guard compared the upload directory
+    # with the published release alone, so `-UploadDir releases\1.0.0.1` while
+    # assembling 1.0.1.0 was accepted: the older cut's directory would have
+    # gained an `upload-1.0.1.0\` and a sibling zip, and .gitignore ignores
+    # neither, so the next `git add -A` would have committed them into a cut
+    # (roadmap Phase 20, F4, reproduced read-only with the extracted guard). The
+    # published root is still named separately because the ordinary cut's
+    # staging directory sits under `releases\` too and the ancestor direction -
+    # an upload directory that would CONTAIN the release - is checked against
+    # both.
     #
     # **Called before the build as well as inside the assembly**, because the
     # geometry depends only on arguments that are known from the start. Checked
@@ -651,27 +758,44 @@ function Assert-UploadSetOutsideRelease {
     # and a sane -UploadDir, unlike the media-root case, but there is no reason
     # to reject an argument late that can be rejected free.
     #
-    # Both paths are already absolute and separator-normalised by
+    # Every path is already absolute and separator-normalised by
     # Resolve-DirectoryArgument, so this compares strings rather than resolving:
     # the early call happens before `releases\<version>\` exists, and
     # Resolve-Path cannot answer for a directory that is not there yet.
-    param([string]$UploadRoot, [string]$PublishedRoot)
+    param([string]$UploadRoot, [string]$UploadZip, [string]$PublishedRoot, [string]$ReleasesRoot)
 
-    $published = $PublishedRoot.TrimEnd('\')
-    $upload = $UploadRoot.TrimEnd('\')
-    $inside = $upload -eq $published -or
-              $upload.StartsWith($published + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
-              $published.StartsWith($upload + '\', [System.StringComparison]::OrdinalIgnoreCase)
-    if (-not $inside) { return }
-
-    throw @"
-the upload set would be assembled at '$upload', which is inside - or contains -
-the published release '$published'.
-Assembling it clears that directory first and then copies the release into it,
-so this would write inside a version directory that is written once and never
-edited. Point -UploadDir somewhere git-ignored and outside releases\; out\ is
-the default and is where the Microsoft files may live.
+    # The repository's own releases\ is protected whatever -ReleasesDir says:
+    # an override points the CUT somewhere else, and the cuts that exist under
+    # the canonical root are still written once and never edited, so an
+    # -UploadDir under one of them is as wrong with the override as without it
+    # (the Phase 20 review's fifth finding).
+    $protected = @()
+    foreach ($p in @($ReleasesRoot, $PublishedRoot, (Join-Path $repo "releases"))) {
+        if (-not [string]::IsNullOrEmpty($p)) { $protected += $p.TrimEnd('\') }
+    }
+    $outputs = @(
+        @{ What = "upload directory"; Path = $UploadRoot },
+        @{ What = "upload archive";   Path = $UploadZip }
+    )
+    foreach ($o in $outputs) {
+        if ([string]::IsNullOrEmpty($o.Path)) { continue }
+        $out = $o.Path.TrimEnd('\')
+        foreach ($p in $protected) {
+            $inside = $out -eq $p -or
+                      $out.StartsWith($p + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
+                      $p.StartsWith($out + '\', [System.StringComparison]::OrdinalIgnoreCase)
+            if (-not $inside) { continue }
+            throw @"
+the $($o.What) would be written at '$out', which is inside - or contains -
+'$p'.
+Every version directory under releases\ is written once and never edited
+(releases\README.md), and the assembly deletes and recreates its upload
+directory and overwrites its archive, so neither may land there: not in the
+version being cut, and not in any older one either. Point -UploadDir somewhere
+git-ignored and outside releases\; out\ is the default.
 "@
+        }
+    }
 }
 
 function Assert-PackageMatchesDeclaredMedia {
@@ -714,10 +838,12 @@ function Assert-PackageMatchesDeclaredMedia {
         throw @"
 '$PkgDir' holds $($unexpected.Count) file(s) the published $InfName does not name, or names elsewhere:
   - $($unexpected -join "`n  - ")
-The upload set is the one channel through which this project distributes files
-that are not its own, and it is exactly the ones the INF names - see
-docs\contributing\legal-provenance.md section 5. Take the file out of the
-package, or add it to [SourceDisksFiles] and cut a release that declares it.
+Since 1.0.0.1 the media carries this project's two files and nothing else: the
+operating system supplies usbd.sys, usbhub.sys, usbport.sys and usbui.dll
+through the INF's LayoutFile, and the INF gate refuses a Microsoft file on the media
+(docs\contributing\legal-provenance.md section 5 records the decision). A file
+the INF does not name is not published; take it out of the package. Declaring a
+new media file is a release-layout decision recorded there, not a packaging step.
 "@
     }
     $absent = @($Expected.Keys | Where-Object { -not $seen.ContainsKey($_) })
@@ -752,18 +878,14 @@ function New-UploadSet {
 
     Write-Step "Upload set"
 
-    $uploadRoot = Join-Path $UploadDir ("upload-" + $Version)
-    # **The archive is not named after the directory it is assembled from**, and
-    # the two names differ on purpose (project owner). `upload-` is a
-    # workspace name inside the git-ignored `out\`; the `.zip` is what a stranger
-    # downloads from a GitHub release and finds in their Downloads folder, where
-    # `upload-0.0.0.5.zip` says nothing about what project it belongs to. The
-    # archive carries no top-level directory - every entry below is written
-    # relative to $uploadRoot - so this name is the only thing the download says
-    # about itself until it is unpacked.
-    $uploadZip = Join-Path $UploadDir ("xhci98-" + $Version + ".zip")
+    # Named in Get-UploadSetPaths, beside the early containment check that
+    # names the same two.
+    $paths = Get-UploadSetPaths -UploadDir $UploadDir -Version $Version
+    $uploadRoot = $paths.Root
+    $uploadZip = $paths.Zip
 
-    Assert-UploadSetOutsideRelease -UploadRoot $uploadRoot -PublishedRoot $PublishedRoot
+    Assert-UploadSetOutsideRelease -UploadRoot $uploadRoot -UploadZip $uploadZip `
+                                   -PublishedRoot $PublishedRoot -ReleasesRoot $ReleasesDir
 
     if (Test-Path -LiteralPath $uploadRoot) {
         Remove-Item -LiteralPath $uploadRoot -Recurse -Force
@@ -793,11 +915,14 @@ function New-UploadSet {
     # **Which directories have to be completed is read off the tree, not taken
     # from -Flavor.** The published tree is copied whole, so a release holding
     # both flavours brings both into the upload set - but only the flavours
-    # named on the command line get the Microsoft files added. Assembling
-    # with `-Flavor release` from a release published with both therefore
-    # shipped a `debug\` directory holding this project's two files and none of
-    # Microsoft's, exit 0, no warning: the nesting defect again, through a
-    # different door (review finding 1).
+    # named on the command line are completed and gated. When the media still
+    # carried Microsoft files (0.0.0.4 to 1.0.0.0), assembling with `-Flavor
+    # release` from a release published with both shipped a `debug\` directory
+    # holding this project's two files and none of the three, exit 0, no
+    # warning: the nesting defect again, through a different door (review
+    # finding 1). The media has carried no such file since 1.0.0.1; what the
+    # rule protects now is that every flavour directory in the asset was gated
+    # by this run.
     #
     # A directory carrying `xhci98.inf` is install media in the making. That is
     # the test used here rather than a list of flavour names, because it stays
@@ -873,30 +998,49 @@ flavour with -Flavor, or leave -Flavor at its default.
                                   -InfName $infName -Label "the published $infName"
 
     foreach ($f in $Flavors) {
-        $pkgDir = $PkgDirs[$f]
+        $pkgDir = $null
+        if ($null -ne $PkgDirs -and $PkgDirs.ContainsKey($f)) { $pkgDir = $PkgDirs[$f] }
         $uploadFlavorDir = Join-Path $uploadRoot $f
         $mediaPaths = @{}
 
-        # The backstop for the check the build loop already made on the
-        # ordinary path - and the only place it is made under -UploadSetOnly,
-        # which never passes through that loop.
-        Assert-PackageMatchesDeclaredMedia -PkgDir $pkgDir -Expected $expected `
-                                           -PublishedPaths $publishedPaths `
-                                           -InfName $infName -Flavor $f
+        if ($null -ne $pkgDir) {
+            # The ordinary cut: the backstop for the check the build loop
+            # already made on the package it has just built.
+            Assert-PackageMatchesDeclaredMedia -PkgDir $pkgDir -Expected $expected `
+                                               -PublishedPaths $publishedPaths `
+                                               -InfName $infName -Flavor $f
 
-        # Copied at the path the INF declares, which is where the check below
-        # will look for it. Taking the layout from the gate's parse rather than
-        # re-parsing [SourceDisksFiles] here is the rule make-package.ps1
-        # follows for the same reason: two parsers would be free to disagree,
-        # and the only way they can disagree is a file staged at one path and
-        # authenticated at another.
-        foreach ($name in $expected.Keys) {
-            $relative = $expected[$name]
-            $source = Join-Path $pkgDir $relative
-            $target = Join-Path $uploadFlavorDir $relative
-            Ensure-Directory (Split-Path -Parent $target)
-            Copy-Item -LiteralPath $source -Destination $target -Force
-            $mediaPaths[$name] = $target
+            # Copied at the path the INF declares, which is where the check
+            # below will look for it. Taking the layout from the gate's parse
+            # rather than re-parsing [SourceDisksFiles] here is the rule
+            # make-package.ps1 follows for the same reason: two parsers would
+            # be free to disagree, and the only way they can disagree is a file
+            # staged at one path and authenticated at another. Since 1.0.0.1
+            # `$expected` is empty and this loop copies nothing.
+            foreach ($name in $expected.Keys) {
+                $relative = $expected[$name]
+                $source = Join-Path $pkgDir $relative
+                $target = Join-Path $uploadFlavorDir $relative
+                Ensure-Directory (Split-Path -Parent $target)
+                Copy-Item -LiteralPath $source -Destination $target -Force
+                $mediaPaths[$name] = $target
+            }
+        } elseif ($expected.Count -gt 0) {
+            # -UploadSetOnly assembles from the tracked directory alone, and
+            # that directory carries this project's two files and nothing else.
+            # An INF naming a third file on the media would need a source this
+            # mode does not have - and since 1.0.0.1 no INF this gate accepts
+            # names one, so this is the refusal for a future layout change
+            # rather than a path a current cut can reach.
+            throw @"
+the published $infName names $($expected.Count) media file(s) beyond this project's two:
+  - $($expected.Keys -join "`n  - ")
+-UploadSetOnly assembles the download from the tracked releases\<version>\
+directory alone, which carries only xhci98.sys and xhci98.inf, so it has no
+source for those. A release whose media carries a third file is a layout
+decision recorded in docs\contributing\legal-provenance.md section 5, and its
+asset has to be assembled by the cut that publishes it.
+"@
         }
 
         # **Is this directory complete install media? Asked of the INF, not of
@@ -911,10 +1055,10 @@ flavour with -Flavor, or leave -Flavor at its default.
         # check-inf.ps1 -PackageDir is the authority instead. It is a second,
         # independent parse of the INF that is about to be shipped in this very
         # directory: it fails PKG-* if any [SourceDisksFiles] entry is absent or
-        # in the wrong place, and with -SourceManifest it re-authenticates each
-        # per-target file by SHA-256 at the path the INF puts it. It is the same
-        # gate make-package.ps1 runs against a staged package, which is exactly
-        # what this directory now is.
+        # in the wrong place, or if a Microsoft file is beside them (the
+        # per-target SHA-256 manifest it once took went with the Microsoft
+        # files in 1.0.0.1). It is the same gate make-package.ps1 runs against
+        # a staged package, which is exactly what this directory now is.
         # **Its output is captured, not left on the pipeline.** This function
         # returns an object, and anything a command inside it writes to stdout
         # is returned alongside - so calling the gate bare made the caller's
@@ -1018,6 +1162,29 @@ If what you want really is to re-cut the published version, drop -UploadSetOnly.
     if ($Version -eq "") {
         $Version = $infVersion
     } elseif (-not (Test-DriverVersionMatches -Reported ($Version + "") -Declared $infVersion)) {
+        if ($UploadSetOnly) {
+            # The gate this mode runs on each assembled flavour directory is
+            # the current tree's, and it encodes the current release's rules;
+            # an older cut fails the rules added since it was cut. Measured
+            # read-only on 2026-09-05: the 1.0.0.1 INF fails six (OS-MISSING
+            # for usbport.sys and usbhub.sys on both NT routes, SUSP-MISSING on
+            # both), all added by 1.0.1.0, and the 1.0.0.0 INF names Microsoft
+            # files on the media, which OS-MEDIA refuses. Weakening the gate or
+            # pinning it per version is not the answer (roadmap Phase 20, F15);
+            # the tree that cut the older version carries the gate it passed.
+            throw @"
+-UploadSetOnly rebuilds the asset of the current cut only, and $Version is not
+it: src\xhci98.inf's DriverVer is $infVersion.
+The INF gate this mode runs on each assembled flavour directory encodes the
+current release's rules, and an older cut fails the rules added since it was
+cut, so its asset cannot be rebuilt from this tree without weakening the gate -
+which is not done. To rebuild the asset of $Version,
+check out the commit that cut it (releases\history.md names the cut) and run
+this mode there; the gate at that commit is the one $Version passed. Whether an
+older cut's asset should be rebuilt at all is the owner's decision under
+releases\README.md.
+"@
+        }
         throw @"
 -Version $Version does not match the INF's DriverVer $infVersion.
 The version is edited in src\xhci_version.h and nowhere else (task 14.1.10);
@@ -1038,16 +1205,26 @@ docs\contributing\build-and-test.md, "Versioning the driver".
     # The upload set is assembled at the end of a cut, from a tree this script
     # has just published. That left one shape unreachable: the release is
     # published and committed, and the *asset* is wrong or gone. Re-running the
-    # cut means -Force, which rebuilds non-reproducible binaries and rewrites a
-    # written-once version directory, so the only scripted repair was the one
-    # thing releases\README.md forbids. This is the way back in.
+    # cut means -Force, which rewrites a written-once version directory, so the
+    # only scripted repair was the one thing releases\README.md forbids. This
+    # is the way back in. (-Force skips one "already exists" refusal and
+    # rebuilds nothing - it stages from the existing obj trees with every gate
+    # still running.)
     #
     # Nothing here is built, and the gates that are about the *build* do not
     # run again - the release this assembles for was gated when it was cut, and
-    # this mode never touches a binary. What stands in for them is the identity
-    # check below: a package whose two files hash the same as the published
-    # ones is the package the release came out of. The gate that is about the
-    # *media* does run, inside the assembly, once per flavour directory.
+    # this mode never touches a binary. The gate that is about the *media* does
+    # run, inside the assembly, once per flavour directory.
+    #
+    # **The tracked directory is the only input.** Until the Phase 20 fix pass
+    # this mode also required `out\pkg-<flavour>\` to exist and to hash-match
+    # the published binaries, standing in for the build gates. That was a
+    # dependency left over from when the media carried Microsoft files the
+    # package supplied: since 1.0.0.1 nothing from the package enters the
+    # asset, so the requirement only stopped a fresh clone - the machine a lost
+    # asset is most likely to be rebuilt on - from rebuilding it
+    # (roadmap Phase 20, F15). What the asset is made of is the published tree,
+    # and the INF gate on each assembled directory is what checks it.
     if ($UploadSetOnly) {
         Write-Step ("Upload set for {0}, from {1}" -f $Version, $finalRoot)
 
@@ -1059,52 +1236,21 @@ To cut one, run this script without it.
 "@
         }
 
-        $pkgDirs = @{}
         foreach ($f in $Flavor) {
             $pubDir = Join-Path $finalRoot $f
             if (-not (Test-Path -LiteralPath $pubDir)) {
                 throw "'$finalRoot' has no $f\ directory, so $Version was not published with that flavour."
             }
-            $pkgDir = Join-Path $PackageRoot ("pkg-" + $f)
-            if (-not (Test-Path -LiteralPath $pkgDir)) {
-                throw @"
-no gated package at '$pkgDir'.
-The upload set is assembled from the package make-package.ps1 gated, and there
-is none for the $f flavour on this machine. Build it with
-scripts\package\make-package.ps1 -Flavor $f - which does not touch
-'$finalRoot' - and run this again.
-"@
-            }
-
-            # **This is the check that stands in for every gate this mode
-            # skips.** Both files in a gated package that hash the same as the
-            # published ones came out of the run that published them. A
-            # package that does not match is some other build.
             foreach ($name in $publishable) {
-                $pub = Join-Path $pubDir $name
-                $pkg = Join-Path $pkgDir $name
-                if (-not (Test-Path -LiteralPath $pkg)) {
-                    throw "'$pkgDir' has no '$name', so it is not the package '$pubDir' was published from."
-                }
-                $pubHash = (Get-FileHash -LiteralPath $pub -Algorithm SHA256).Hash
-                $pkgHash = (Get-FileHash -LiteralPath $pkg -Algorithm SHA256).Hash
-                if ($pubHash -ne $pkgHash) {
-                    throw @"
-'$pkg' is not the file published as '$pub':
-  published $pubHash
-  package   $pkgHash
-So this package is not the one $Version was cut from. Rebuild the package from
-the sources $Version was built from, or cut a new version - do not assemble an
-upload set around a driver the release does not contain.
-"@
+                if (-not (Test-Path -LiteralPath (Join-Path $pubDir $name))) {
+                    throw "'$pubDir' has no '$name', so it is not a published flavour directory of $Version."
                 }
             }
-            $pkgDirs[$f] = $pkgDir
-            Write-Ok ("{0}\: '{1}' holds the published binary and INF, by SHA-256" -f $f, $pkgDir)
+            Write-Ok ("{0}\: '{1}' holds the published binary and INF" -f $f, $pubDir)
         }
 
         $set = New-UploadSet -PublishedRoot $finalRoot -Version $Version -Flavors $Flavor `
-                             -PkgDirs $pkgDirs -UploadDir $UploadDir -Repo $repo `
+                             -PkgDirs @{} -UploadDir $UploadDir -Repo $repo `
                              -Publishable $publishable
 
         Write-Step "Done"
@@ -1271,8 +1417,9 @@ readme.txt prints it beside the history entry, so the two cannot disagree.
     # builds and published the version directory before saying no. Review
     # round 5.
     if (-not $SkipUploadSet) {
-        Assert-UploadSetOutsideRelease -UploadRoot (Join-Path $UploadDir ("upload-" + $Version)) `
-                                       -PublishedRoot $finalRoot
+        $early = Get-UploadSetPaths -UploadDir $UploadDir -Version $Version
+        Assert-UploadSetOutsideRelease -UploadRoot $early.Root -UploadZip $early.Zip `
+                                       -PublishedRoot $finalRoot -ReleasesRoot $ReleasesDir
     }
 
     # --- build and gate each flavour, then take only what may be tracked -----
@@ -1294,7 +1441,21 @@ readme.txt prints it beside the history entry, so the two cannot disagree.
         $pkgArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
                      $makePackage, "-Flavor", $f, "-OutDir", $pkgDirForBuild)
         if ($NoTargetEvidence) { $pkgArgs += "-NoTargetEvidence" }
-        & powershell.exe @pkgArgs
+        # ErrorActionPreference relaxed across the call, as every other native
+        # call in this script does and this one did not until the 2026-09-07
+        # audit's H17. In Windows PowerShell 5.1 a native command's stderr line
+        # becomes an ErrorRecord, so under "Stop" a single warning from the
+        # packager aborts the cut here with an empty message instead of
+        # reaching the exit-code test below. It only bites when the child's
+        # stderr is redirected, which is why it survived: an interactive run
+        # never showed it.
+        $savedEap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & powershell.exe @pkgArgs
+        } finally {
+            $ErrorActionPreference = $savedEap
+        }
         if ($LASTEXITCODE -ne 0) {
             throw @"
 make-package.ps1 failed for the $f flavour, so there is nothing to release.
@@ -1374,14 +1535,112 @@ meant: scripts\build-driver.cmd $f
 "@
         }
 
+        #
+        # **And that the tree can still reproduce it** (the 2026-09-07 audit's
+        # H13). This script already refuses a staged XHCIQUAL or XHCISNAP older
+        # than its own sources; the driver had no equivalent, and the only tie
+        # between src\ and the published .sys was the file version against the
+        # INF's - which cannot see a code edit that did not bump the version.
+        #
+        # `scripts\source-stamp.ps1` compares CONTENT, not timestamps, and
+        # says at length why: an mtime moves on a checkout, a revert or a
+        # comment-only commit, so a timestamp rule would fire on binaries it is
+        # byte-for-byte responsible for and would be bypassed on its first use.
+        #
+        # Exit 2 is "no stamp beside this binary", which only a build older than
+        # that script gives - `scripts\build-driver.cmd` has written one since
+        # the same commit, so every binary this tree produces has one.
+        #
+        # It was a bare warning at first, and that made the whole check
+        # optional: an unstamped binary is exactly the case where nothing is
+        # known about its sources, and it was the case that passed. It is now
+        # a REFUSAL with a named way past it, because the reason for the
+        # leniency is real but narrow - a binary built before the stamp existed
+        # cannot be rebuilt to acquire one without moving the PE link timestamp
+        # and invalidating every reading already taken on the published bytes.
+        # That is a decision about a specific release, so it is spelled as one
+        # on the command line and printed into the log, rather than being the
+        # silent default for every cut thereafter. A mismatch (exit 1) is a
+        # refusal with no way past it at all.
+        #
+        # The stamp is written beside the BUILD output, not beside the staged
+        # copy: only the INF and the .sys are copied into the staging
+        # directory. Deriving the directory from $sys - which by here points
+        # into releases\.staging-<version>\<flavour> - is how the first cut of
+        # this check took the "no stamp" path on every ordinary release, and
+        # would have gone on taking it with the sources changed underneath.
+        $stampScript = Join-Path $repo "scripts\source-stamp.ps1"
+        $objRoot = Join-Path $repo ("src\" + $objDirName[$f] + "\i386")
+        $builtSys = Join-Path $objRoot "xhci98.sys"
+
+        # And a stamp only speaks for the binary it sits beside, so the staged
+        # bytes have to BE those bytes. Without this the check answers for
+        # src\obj*\i386\xhci98.sys while some other file ships.
+        if (-not (Test-Path -LiteralPath $builtSys)) {
+            throw @"
+the $f binary about to be published has no counterpart at
+$builtSys, so nothing ties it to the sources in src\. Build the flavour you
+meant: scripts\build-driver.cmd $f
+"@
+        }
+        $builtHash = (Get-FileHash -LiteralPath $builtSys -Algorithm SHA256).Hash
+        $stagedHash = (Get-FileHash -LiteralPath $sys -Algorithm SHA256).Hash
+        if ($builtHash -ne $stagedHash) {
+            throw @"
+the binary about to be published as $f\ is not the one in
+$builtSys ($stagedHash vs $builtHash), so the source stamp beside that build
+says nothing about the bytes being shipped. Re-run the packager against the
+build you mean: scripts\build-driver.cmd $f
+"@
+        }
+
+        if (Test-Path -LiteralPath $stampScript) {
+            $stampOut = & powershell -NoProfile -ExecutionPolicy Bypass `
+                -File $stampScript -Check $objRoot 2>&1
+            $stampCode = $LASTEXITCODE
+            if ($stampCode -eq 1) {
+                throw @"
+the binary about to be published as $f\ was built from sources this tree no
+longer holds:
+$($stampOut -join "`n")
+Rebuild it (scripts\build-driver.cmd $f) so the published bytes are ones the
+tree can reproduce - or, if the difference is deliberate and the bytes are the
+ones you mean to ship, rebuild anyway and re-read whatever was measured on the
+old ones. A release nobody can rebuild is a release nobody can debug.
+"@
+            } elseif ($stampCode -eq 2) {
+                if (-not $AllowUnstampedDriver) {
+                    throw @"
+no source stamp beside the $f binary in
+$objRoot, so this script cannot tell whether src\ still reproduces it - which
+is the one case where nothing at all is known about the published bytes.
+Rebuild it (scripts\build-driver.cmd $f), which writes the stamp as it goes.
+If this binary must ship UNSTAMPED - the only good reason is that it predates
+scripts\source-stamp.ps1 and a rebuild would move its PE link timestamp and
+invalidate readings already taken on these exact bytes - say so:
+      scripts\package\make-release.ps1 ... -AllowUnstampedDriver
+"@
+                }
+                Write-Warn ("no source stamp beside the $f binary, so this script " +
+                            "cannot tell whether src\ still reproduces it, and " +
+                            "-AllowUnstampedDriver was passed. Nothing here has " +
+                            "checked the published bytes against src\.")
+            } elseif ($stampCode -ne 0) {
+                throw "scripts\source-stamp.ps1 -Check '$objRoot' failed: $($stampOut -join "`n")"
+            } else {
+                Write-Ok "$f binary matches the sources in src\"
+            }
+        }
+
         $staged[$f] = [pscustomobject]@{
             Flavor    = $f
             Published = $f
             Path      = $sys
             Dir       = $destDir
-            # Kept so the upload set can take the Microsoft files from the
-            # directory make-package.ps1 already gated, rather than re-deriving
-            # where they came from or parsing [SourceDisksFiles] a second time.
+            # Kept so the upload set can take any file the INF declares beyond
+            # this project's two from the directory make-package.ps1 already
+            # gated - none since 1.0.0.1 - rather than re-deriving where it came
+            # from or parsing [SourceDisksFiles] a second time.
             PkgDir    = $pkgDir
             Length    = (Get-Item -LiteralPath $sys).Length
             Sha256    = (Get-FileHash -LiteralPath $sys -Algorithm SHA256).Hash
@@ -1649,8 +1908,9 @@ the tool (xhcisnap\build.cmd) - see docs\contributing\build-and-test.md,
         } else {
             $contents += ("  {0}\  - only when diagnosing a problem" -f $s.Published.ToUpper())
             $contents += ""
-            $contents += "  The same driver, built so a maintainer can get more out of it."
-            $contents += "  It prints nothing as it runs. It is here only so that it can be"
+            $contents += "  The same driver, built so that a crash on it can be traced"
+            $contents += "  further back. It records nothing more than RELEASE\ does, and"
+            $contents += "  it prints nothing as it runs. It is here only so that it can be"
             $contents += "  installed at this exact version if something goes wrong. Do not"
             $contents += "  install it otherwise - and note that BOTH builds answer"
             $contents += "  XHCISNAP, so you do not need this one to send a report."
@@ -1712,12 +1972,15 @@ the tool (xhcisnap\build.cmd) - see docs\contributing\build-and-test.md,
     USB 2.0 for Windows 98 SE, ME, 2000 SP4 and XP on xHCI-only machines
 ==============================================================================
 
-Released {DATE}.
+Released {DATE}.{INCOMPLETE}
 
 Most x86 PCs made from around the mid 2010s onward have USB 3.0 (xHCI)
-controllers and nothing else. Windows 98 SE, Windows ME and Windows 2000
-have no support for those. This driver fills that gap. It also installs on
-32-bit Windows XP, as incidental support.
+controllers and nothing else. Windows 98 SE, Windows ME, Windows 2000 and
+32-bit Windows XP have no support for those, and this driver fills that gap
+on all four. Windows 98 SE and Windows 2000 SP4 are the two primary targets,
+and a release has to work on both. Only Windows 98 SE has been validated on
+real hardware; Windows 2000 SP4, Windows ME and 32-bit Windows XP have been
+validated in virtual machines only.
 
 It gives you USB 2.0 speeds: High Speed, Full Speed and Low Speed. USB 3.0
 SuperSpeed is out of scope. A USB 3.0 device still works, at USB 2.0 speed,
@@ -1729,7 +1992,7 @@ WHY ONLY USB 2.0, WHEN THE CONTROLLER IS A USB 3.0 ONE
 
 The USB stack these systems already have - usbport.sys and everything above
 it - does not support USB 3.0 at all. This driver is only the bottom layer, so
-SuperSpeed would mean rewriting that whole stack on both systems: far more
+SuperSpeed would mean rewriting that whole stack on all four: far more
 work than this driver, for a speed that most machines running Windows 98 or
 Windows 2000 could not make much use of anyway.
 
@@ -1749,7 +2012,7 @@ WHAT THE VERSION NUMBER MEANS, AND WHAT IT DOES NOT
 
 It means the driver does what this file says it does and that its limits are
 written down in section 7. It does not mean nothing is left. This is a hobby
-driver for two operating systems that left support two decades ago, it has run
+driver for operating systems that left support two decades ago, it has run
 on a small number of machines, and BUGS ARE NOT UNEXPECTED.
 
 Please report what you find, on the project's GitHub page:
@@ -1765,7 +2028,7 @@ CONTENTS OF THIS FILE
 
   1. Check the machine first (optional, but recommended)
   2. What you need
-  3. Check the media is complete
+  3. The files Windows supplies
   4. Install
   5. Using it
   6. If something goes wrong
@@ -1828,7 +2091,7 @@ the safety notes spelled out.
       --xhci --ehci --ohci   the same three selectors, written as options
       --scan TYPE            the same again; repeat it to combine families
 
-  READ-ONLY OPTIONS - these change nothing on the machine.
+  READ-ONLY MODES - these change nothing on the machine.
 
       --quick           the no-argument quick scan, asked for explicitly
       --probe-only      read-only discovery, fuller than --quick. It reads
@@ -1836,6 +2099,13 @@ the safety notes spelled out.
                         has already switched it on, and switches nothing on
                         itself
       --no-active       another name for --probe-only
+
+  MODIFIERS - these say what to do with the report, not what to run.
+  ON THEIR OWN THEY DO NOT MAKE THE RUN READ-ONLY. Any argument at all
+  turns off the no-argument quick scan, so XHCIQUAL --log FILE performs
+  the FULL ACTIVE run below. Pair one with --quick or --probe-only when a
+  read-only run is what you want.
+
       --no-page         do not stop at the end of each screenful
       --serial          mirror the output to COM1, 115200 8N1
       --log [FILE]      also write the report to a file, default
@@ -1911,7 +2181,7 @@ modern interrupt mechanism (MSI) that such a controller would require.
                      ME and 32-bit Windows XP (SP3) in virtual machines only
                      (neither has been run on a real machine).
 
-  On Windows 98      NUSB 3.3e or the newer SweetLow USB 2.0 stack, your
+  On Windows 98      NUSB 3.3 or the newer SweetLow USB 2.0 stack, your
                      choice, installed BEFORE this driver (section 4).
 
   On Windows ME      SweetLow's USB 2.0 stack, installed BEFORE this driver
@@ -1938,13 +2208,13 @@ are in release\ and in debug\. Nothing else is in the package, and there is
 nothing to complete: a copy taken from the project's source repository is
 the same two files.
 
-Three files the driver depends on are NOT in the package, because they are
-Windows' own, unmodified, and this download redistributes nothing of
-Microsoft's:
+Four files the driver depends on are NOT in the package, because they are
+Windows' own, unmodified, and no Microsoft file is in this download:
 
-  usbd.sys     The USB 2.0 root hub imports it on both systems. Without it
-               the USB ROOT HUB fails: Code 2 on Windows 98, error
-               0xc0000034 naming usbhub20.sys on Windows 2000.
+  usbd.sys     The USB 2.0 root hub imports it on every target. Without it
+               the USB ROOT HUB fails: Code 2 on Windows 98 and Windows ME,
+               error 0xc0000034 naming usbhub20.sys on Windows 2000 and
+               Windows XP.
 
   usbhub.sys   On Windows 98, the driver for devices that are more than one
                thing at once - a sound card with a volume knob, a headset
@@ -1959,6 +2229,10 @@ Microsoft's:
                runs. On Windows 98 the USB 2.0 stack installed first (NUSB
                or SweetLow's) supplies it.
 
+  usbui.dll    NEW IN 1.0.2.0, and the one file here that is only cosmetic.
+               It adds an extra USB property page in Device Manager. It is
+               copied on all four targets.
+
 WINDOWS ONLY INSTALLS ITS USB FILES WHEN SETUP FINDS A USB CONTROLLER IT
 RECOGNISES, and on an xHCI-only machine it never does, so on such a machine
 none of them is there. The install in step 4 therefore asks Windows to copy
@@ -1972,15 +2246,18 @@ Windows recognised - keeps its own files and is asked for nothing.
                   install shows "Insert Disk" asking for the Windows 98
                   Second Edition CD-ROM: insert it and click OK, and if it
                   then asks where to copy from, give it the CD's WIN98
-                  folder. It is asking for usbd.sys and usbhub.sys, not for
-                  anything of this driver's.
+                  folder. It is asking for usbd.sys, usbhub.sys and
+                  usbui.dll, not for anything of this driver's.
 
   WINDOWS ME      The same as Windows 98 SE, with the Windows ME CD. The
                   machine tried (a virtual one) had the CABs on its hard
                   disk from its own Setup and asked for nothing.
 
-  WINDOWS 2000    Nothing to do: all three come from the driver cache every
+  WINDOWS 2000    Nothing to do: all four come from the driver cache every
   AND XP          Windows 2000 or XP installation has (Driver Cache\i386).
+                  On Windows XP all four are in sp3.cab; on Windows 2000
+                  three are in sp4.cab and usbui.dll in driver.cab beside
+                  it, two cabinets in one pass and still no prompt.
 
 If the prompt is cancelled the driver still installs, but the root hub fails
 as described above. That reads as a fault in this driver and is not one: put
@@ -1997,20 +2274,20 @@ INSTALL FROM THE RELEASE\ DIRECTORY. This package carries BOTH builds side by
 side - RELEASE\ and DEBUG\, each a complete set of files with the same names -
 so the directory you point Windows at is what decides which driver you get.
 RELEASE\ is the one you want. DEBUG\ is the same driver built so that a
-maintainer can get more out of it if you are asked for a report, and there
-only for troubleshooting a machine that has already gone wrong. It prints
-nothing as it runs. Section 8 describes both, and nothing
-about a copied file
-says which one it is - so point at a directory, never at a loose xhci98.sys.
+crash on it can be traced further back. It records nothing more than
+RELEASE\ does, and it is there only for troubleshooting a machine that has
+already gone wrong. It prints nothing as it runs. Section 8 describes both,
+and nothing about a copied file says which one it is - so point at a
+directory, never at a loose xhci98.sys.
 
 Put the whole unzipped package somewhere the machine can read - a floppy, a
 CD, a shared folder - then:
 
   WINDOWS 98 SE
       A USB 2.0 stack (usbport.sys + usbhub20.sys) has to be there first:
-      either NUSB 3.3e or the newer SweetLow stack, your choice.
+      either NUSB 3.3 or the newer SweetLow stack, your choice.
 
-        NUSB 3.3e - the configuration this driver is tested against.
+        NUSB 3.3 - the configuration this driver is tested against.
         Install it first. NUSB 3.6 carries the same stack and also works.
 
         SWEETLOW'S STACK - the newer Windows XP lineage of the same port
@@ -2033,8 +2310,11 @@ CD, a shared folder - then:
       and point it at the RELEASE\ directory. During the copy, on a machine
       that never had a USB controller Windows recognised, "Insert Disk"
       asks for the Windows 98 Second Edition CD-ROM: that is Windows
-      fetching its own usbd.sys and usbhub.sys (section 3). Insert it and
-      click OK. Reboot when asked.
+      fetching its own usbd.sys, usbhub.sys and usbui.dll (section 3).
+      Insert it and click OK. Reboot when asked. Upgrading from a release
+      before 1.0.2.0 can raise that prompt on a machine whose last install
+      did not, because usbui.dll is new here; it is on the same cabinet as
+      the other two, so the same CD answers it.
 
       (If Windows finds the controller for you first, the Add New Hardware
       Wizard asks the same question - give it RELEASE\ too.)
@@ -2054,8 +2334,8 @@ CD, a shared folder - then:
       Open Device Manager and find the unrecognised xHCI controller, then
           Properties -> Driver -> Update Driver -> Have Disk
       and point it at the RELEASE\ directory. Nothing else is asked for;
-      usbport.sys, usbd.sys and usbhub.sys come from the driver cache every
-      installation has.
+      usbport.sys, usbd.sys, usbhub.sys and usbui.dll come from the driver
+      cache every installation has.
 
   WINDOWS XP (32-BIT)
       The same route as Windows 2000 SP4:
@@ -2090,11 +2370,13 @@ Two things are specific to this driver and worth knowing in advance:
     carries the USB 2.0 wires, and that is the path used. The SuperSpeed half
     of each connector is deliberately left switched off.
 
-  * WINDOWS 98 ONLY: INSTALLING CHANGES ONE MACHINE-WIDE SETTING. It writes
+  * INSTALLING CHANGES ONE MACHINE-WIDE SETTING, ON EVERY SYSTEM. It writes
     DisableSelectiveSuspend = 1, which stops the USB stack putting the
-    controller to sleep. Without it the controller sleeps within about half a
-    second and cannot notice anything plugged in afterwards. It affects ANY
-    USB controller in the machine, and uninstalling does NOT remove it. See
+    controller to sleep. Without it Windows 98 sleeps the controller within
+    about half a second of the last transfer and Windows XP within about half
+    a minute of a start with nothing attached, and a sleeping controller
+    cannot notice anything plugged in afterwards. It affects ANY USB
+    controller in the machine, and uninstalling does NOT remove it. See
     section 9.
 
   WINDOWS 98 WITH NUSB: STOPPING A RUNNING USB CONTROLLER CRASHES THE MACHINE
@@ -2150,11 +2432,11 @@ Two things are specific to this driver and worth knowing in advance:
        crash.
 
   A Windows 98 uninstall then removes REGISTRY ENTRIES ONLY. xhci98.sys, the
-  usbd.sys and usbhub.sys the install had Windows copy from its CD (section
-  3), the setup engine's cached copy of xhci98.inf (under
+  usbd.sys, usbhub.sys and usbui.dll the install had Windows copy from its
+  CD (section 3), the setup engine's cached copy of xhci98.inf (under
   C:\WINDOWS\INF\OTHER) and the DisableSelectiveSuspend value of section 9
-  all stay behind. Delete them by hand if you want them gone; the two Windows
-  files are Windows' own and harmless where they are.
+  all stay behind. Delete them by hand if you want them gone; the three
+  Windows files are Windows' own and harmless where they are.
 
   AFTER AN UPGRADE ON WINDOWS 98, RUN THE INF ONCE BY HAND
   .......................................................
@@ -2175,8 +2457,8 @@ Two things are specific to this driver and worth knowing in advance:
 
   XHCISNAP.EXE is in the XHCISNAP directory of this package. It reads the
   driver's own log straight out of the running machine and writes a report
-  you can paste into a bug report. It works the same way on both systems,
-  and on Windows 98 it is the ONLY way to get anything out.
+  you can paste into a bug report. It works the same way on every target,
+  and on Windows 98 and Windows ME it is the ONLY way to get anything out.
 
       1. XHCISNAP -verbosity 2
       2. restart the machine
@@ -2312,7 +2594,7 @@ debug throughout, in its build scripts and its documentation alike.)
 ==============================================================================
 
 Every registry value this driver reads or writes. There are three - two
-the driver reads, and one the Windows 98 installer writes machine-wide.
+the driver reads, and one the installer writes machine-wide on every system.
 
   YOU SHOULD NOT NEED THIS SECTION. XHCISNAP -verbosity 2 sets the one that
   matters, on every controller, and finds the key itself. It is here so you
@@ -2360,13 +2642,13 @@ the driver reads, and one the Windows 98 installer writes machine-wide.
   A value that is missing entirely is not an error either - the driver starts
   normally with everything off, and the report says whether it read nothing
   or read a zero. They live in the device's own driver key, which is spelled
-  differently on the two systems:
+  one way on the NT targets and another on the 9x ones:
 
-    Windows 2000
+    Windows 2000 and Windows XP
       HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Class\
         {36FC9E60-C465-11CF-8056-444553540000}\0002
 
-    Windows 98
+    Windows 98 SE and Windows ME
       HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\Class\USB\0002
 
   THE LAST PART OF THE PATH IS ASSIGNED BY THE MACHINE AND WILL NOT
@@ -2407,16 +2689,16 @@ the driver reads, and one the Windows 98 installer writes machine-wide.
   something happens on the bus. Level 1 adds none of that and still lets
   XHCISNAP read the counters, which is why it exists.
 
-  ON WINDOWS 98 THE SNAPSHOT ROUTE IS THE ONE THAT WORKS, and that is the
-  whole of what changed in this version. XhciLogDebugView still delivers
-  nothing there, for the reason given above, and the driver-written log file
-  is gone. XhciLogVerbosity plus XHCISNAP is how a Windows 98 machine produces
-  a report - see section 6. On Windows 2000 both routes work.
+  ON WINDOWS 98 THE SNAPSHOT ROUTE IS THE ONE THAT WORKS. XhciLogDebugView
+  delivers nothing there, for the reason given above, and there is no
+  driver-written log file. XhciLogVerbosity plus XHCISNAP is how a Windows 98
+  machine produces a report - see section 6. On Windows 2000 both routes
+  work.
 
-  DisableSelectiveSuspend  -  both systems
+  DisableSelectiveSuspend  -  every target
   ........................................
 
-  DWORD, written as 1 by the install on both systems, in
+  DWORD, written as 1 by the install on every target, in
 
       HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\USB
 
@@ -2437,12 +2719,15 @@ the driver reads, and one the Windows 98 installer writes machine-wide.
       previous behaviour back - this driver's own devices then go back to
       needing Refresh.
 
-  Until 1.0.0.1 the Windows 2000 install withheld it, because that system's
-  USB stack never idles this controller and the value would have changed
-  nothing. Windows XP's stack does idle it, about half a minute after start,
-  so since 1.0.1.0 the install writes it on Windows 2000 and XP as well as
-  on Windows 98. On Windows 2000 it still changes nothing you can see; it is
-  the same machine-wide setting, with the same three consequences.
+  Until 1.0.1.0 the Windows 2000 install withheld it. Windows 98's USB stack
+  was measured putting this controller to sleep within about half a second
+  of the last transfer, and Windows XP's within about half a minute of a
+  start with nothing attached, and a sleeping controller cannot report a
+  newly plugged device - so since 1.0.1.0 the install writes it on every
+  system. Windows 2000's own USB stack was not seen putting this controller
+  to sleep at all, with or without the value (measured in a virtual
+  machine); there it is the same machine-wide setting, with the same three
+  consequences.
 
 
 ==============================================================================
@@ -2458,15 +2743,54 @@ the driver reads, and one the Windows 98 installer writes machine-wide.
 GNU GPL v2 - see the LICENSE file in this directory, beside this readme. This
 applies to xhci98.sys and xhci98.inf, which are this driver's own work.
 
-No Microsoft file is in this download. The usbd.sys, usbhub.sys and (on
-Windows 2000) usbport.sys the install needs are copied by Windows from your
-own Windows installation source (section 3); nothing here grants you any
-right in them, and nothing here redistributes them.
+No Microsoft file is in this download. The usbd.sys, usbhub.sys, usbui.dll
+and (on Windows 2000 and XP) usbport.sys the install needs are copied by
+Windows from your own Windows installation source (section 3); nothing here
+grants you any right in them, and nothing here redistributes them.
 
 The provenance record for everything the project depends on but does not own
 is in docs/contributing/legal-provenance.md, in the project's source
 repository rather than here.
 '@
+
+    #
+    # **Version literals in the perpetual template, each one a decision.**
+    #
+    # The template above is written once and used by every cut, but two of its
+    # sentences are about a particular release - `usbui.dll` being new in
+    # 1.0.2.0, and an upgrade from before it raising a prompt a previous
+    # install did not. Both are still true at any later version, which is
+    # exactly why nobody would notice them going stale, and until the
+    # 2026-09-07 audit's H15 nothing made anyone look. Everything else in the
+    # template says {VERSION} and is substituted.
+    #
+    # So: every four-part version written into the template by hand has to be
+    # listed here with the reason it is there. A new one fails the cut until
+    # somebody decides it belongs; a listed one that has stopped being worth
+    # saying is removed from both places together. This runs against the
+    # template BEFORE substitution, so {VERSION} and the embedded history.md -
+    # which legitimately names every release there has ever been - are not in
+    # scope.
+    #
+    $allowedTemplateVersions = @{
+        "1.0.0.1" = "the release the media stopped carrying any Microsoft file"
+        "1.0.1.0" = "the release usbport.sys joined the NT install path"
+        "1.0.2.0" = "the release usbui.dll joined every install path; named in section 3's file list and in the Windows 98 install step, because an upgrade from before it can raise a CD prompt a previous install did not"
+    }
+    $templateVersions = @([regex]::Matches($template, '\b\d+\.\d+\.\d+\.\d+\b') |
+                          ForEach-Object { $_.Value } | Sort-Object -Unique)
+    $unlisted = @($templateVersions | Where-Object { -not $allowedTemplateVersions.ContainsKey($_) })
+    if ($unlisted.Count -gt 0) {
+        throw @"
+the readme template names version(s) $($unlisted -join ', ') by hand, and
+nothing in this script says why. Everything version-specific in that template
+is substituted from {VERSION}; a literal is release-specific prose in a
+perpetual file, which is how a readme goes quietly stale. Either write it with
+{VERSION}, or add it to `$allowedTemplateVersions` above with the reason it has
+to be spelled out - and check the others there are still worth saying while you
+are in it.
+"@
+    }
 
     # Markdown -> plain text for the embedded history.
     #
@@ -2478,9 +2802,41 @@ repository rather than here.
     # indent - the paragraph shape survives, the width is enforced.
     $historyText = @(ConvertFrom-MarkdownBlocks -Lines $history -Width 78)
 
+    #
+    # **An incomplete cut has to say so IN THE FILE**, which is the 2026-09-07
+    # audit's H14. `-SkipQualtool` and `-SkipSnapTool` warn on the console and
+    # leave the section-8 listing out, but every other mention of those
+    # directories stayed: section 1 tells the reader the checker is in
+    # XHCIQUAL\, section 6 tells them to run XHCISNAP, and neither directory is
+    # there. build-and-test.md says the result "is incomplete and says so", and
+    # the console is not where a user reads it.
+    #
+    $missingTools = @()
+    if ($null -eq $qualtoolStaged) { $missingTools += "XHCIQUAL\ (the DOS machine checker of section 1)" }
+    if ($null -eq $snaptoolStaged) { $missingTools += "XHCISNAP\ (the report tool of section 6)" }
+    $incomplete = ""
+    if ($missingTools.Count -gt 0) {
+        # Leading blank line included, so an empty substitution leaves the
+        # "Released <date>." line exactly as it was.
+        $incomplete = @"
+
+
+******************************************************************************
+ THIS DOWNLOAD IS INCOMPLETE. It was cut without:
+
+$(($missingTools | ForEach-Object { "      " + $_ }) -join "`r`n")
+
+ The driver itself is whole and installs normally. What is missing is the
+ tooling, so the parts of this file that tell you to run those programs
+ cannot be followed - ignore them, or get a complete download.
+******************************************************************************
+"@
+    }
+
     $readme = $template.
         Replace("{VERSION}", $Version).
         Replace("{DATE}", $today).
+        Replace("{INCOMPLETE}", $incomplete).
         Replace("{CONTENTS}", (($contents -join "`r`n").TrimEnd() + "`r`n")).
         Replace("{HISTORY}", (($historyText -join "`r`n").TrimEnd()))
 
@@ -2495,12 +2851,8 @@ repository rather than here.
     # now that names and lists are substituted in, a line's width depends on the
     # manifest. The first substitution overran by nine characters on the day it
     # was written, in a file nobody re-reads after generating it.
-    $overLong = @(($readme -split "`r?`n") | Where-Object { $_.Length -gt 78 })
-    if ($overLong.Count -gt 0) {
-        throw ("readme.txt has {0} line(s) past 78 columns, the first being:`n{1}" -f $overLong.Count, $overLong[0])
-    }
-
-    Write-AsciiFile -Path (Join-Path $destRoot "readme.txt") -Lines ($readme -split "`r?`n")
+    Write-GeneratedText -Path (Join-Path $destRoot "readme.txt") `
+                        -Lines ($readme -split "`r?`n")
 
     # --- the qualifier's own readme -----------------------------------------
     if ($null -ne $qualtoolStaged) {
@@ -2620,13 +2972,22 @@ WHICH CONTROLLERS IT LOOKS AT
   --scan TYPE            the same again; repeat it to combine families
 
 
-READ-ONLY OPTIONS - these change nothing on the machine
+READ-ONLY MODES - these change nothing on the machine
 
   --quick           the no-argument quick scan, asked for explicitly
   --probe-only      read-only discovery, fuller than --quick. It reads the
                     controller's memory window only if the firmware has
                     already switched it on, and switches nothing on itself
   --no-active       another name for --probe-only
+
+
+MODIFIERS - these say what to do with the report, not what to run
+
+  ON THEIR OWN THEY DO NOT MAKE THE RUN READ-ONLY. Any argument at all
+  turns off the no-argument quick scan, so XHCIQUAL --log FILE performs the
+  FULL ACTIVE run below. Pair one with --quick or --probe-only when a
+  read-only run is what you want.
+
   --no-page         do not stop at the end of each screenful
   --serial          mirror the output to COM1, 115200 8N1
   --log [FILE]      also write the report to a file, default XHCIQUAL.LOG.
@@ -2722,8 +3083,8 @@ notices are in NOTICE.TXT beside this file, and this product uses DOS/32
 Advanced DOS Extender technology.
 '@
         $qualReadme = $qualReadme.Replace("{VERSION}", $Version)
-        Write-AsciiFile -Path (Join-Path $qualtoolStaged "readme.txt") `
-                        -Lines ($qualReadme -split "`r?`n")
+        Write-GeneratedText -Path (Join-Path $qualtoolStaged "readme.txt") `
+                            -Lines ($qualReadme -split "`r?`n")
 
         # --- the notices the qualifier binary carries with it ----------------
         #
@@ -2822,8 +3183,8 @@ this file records is the linkage and the copyright above; the project's full
 provenance record is docs\contributing\legal-provenance.md, section 2a.
 '@
         $qualNotice = $qualNotice.Replace("{VERSION}", $Version)
-        Write-AsciiFile -Path (Join-Path $qualtoolStaged "NOTICE.TXT") `
-                        -Lines ($qualNotice -split "`r?`n")
+        Write-GeneratedText -Path (Join-Path $qualtoolStaged "NOTICE.TXT") `
+                            -Lines ($qualNotice -split "`r?`n")
         Write-Ok "NOTICE.TXT written beside XHCIQUAL.EXE (DOS/32A + Open Watcom runtime)"
     }
 
@@ -2843,10 +3204,10 @@ If USB is not working properly with this driver, this is what to run. It reads
 the driver's own log straight out of the running machine and writes a report
 you can paste into a bug report.
 
-On Windows 98 it is the ONLY way to get anything out. That is not a gap in this
-driver - it is the price of how it plugs into Windows. The usual ways a driver
-writes a log are closed to it, and this route goes through the Microsoft USB
-driver it sits underneath, which does have them.
+On Windows 98 it is the ONLY way to get anything out. That is not a gap in
+this driver - it is the price of how it plugs into Windows. The usual ways
+a driver writes a log are closed to it, and this route goes through the
+Microsoft USB driver it sits underneath, which does have them.
 
 It changes nothing about how the driver behaves on the bus, and writes no file
 it was not asked to. It does READ the controller's port registers, which is a
@@ -2871,16 +3232,16 @@ state. See the registry section for what that does and does not mean.
 
 Then send C:\MYDUMP.TXT. Attach C:\MYDUMP.BIN as well if you are asked for it.
 
-You never have to open REGEDIT. Step 1 does the whole of that for you, on every
-xHCI controller the machine has.
+You never have to open REGEDIT. Step 1 does the whole of that for you, on
+every xHCI controller the machine has.
 
 
  WHY STEP 1 IS NOT OPTIONAL
 ------------------------------------------------------------------------------
 
-The driver answers nothing until it is asked to, and it reads that setting once
-when it starts. So without step 1 and the restart this tool gets no answer at
-all - which is right, not broken.
+The driver answers nothing until it is asked to, and it reads that setting
+once when it starts. So without step 1 and the restart this tool gets no
+answer at all - which is right, not broken.
 
 Level 2 is the one to use. The others exist and a maintainer may ask for one:
 
@@ -2912,9 +3273,9 @@ Level 2 is the one to use. The others exist and a maintainer may ask for one:
 
 That checks whether the route to the driver works at all, separately from
 whether this driver answers on it. If it says the request reached a driver and
-that driver declined, the usual cause is simply that step 1 has not been done -
-or that the machine has more than one USB controller and this is not the right
-one, in which case try -c 1 and -c 2.
+that driver declined, the usual cause is simply that step 1 has not been
+done - or that the machine has more than one USB controller and this is not
+the right one, in which case try -c 1 and -c 2.
 
 If it cannot open the device at all, no xHCI controller is started on this
 machine, and there is nothing for this tool to read.
@@ -2931,8 +3292,8 @@ file that runs on a machine with nothing installed on it. That linkage is
 recorded in NOTICE.TXT beside this file.
 '@
         $snapReadme = $snapReadme.Replace("{VERSION}", $Version)
-        Write-AsciiFile -Path (Join-Path $snaptoolStaged "readme.txt") `
-                        -Lines ($snapReadme -split "`r?`n")
+        Write-GeneratedText -Path (Join-Path $snaptoolStaged "readme.txt") `
+                            -Lines ($snapReadme -split "`r?`n")
         Write-Ok "readme.txt written beside XHCISNAP.EXE"
 
         # --- the notices the snapshot reader carries with it ------------------
@@ -2969,10 +3330,11 @@ GPL v2 - see the LICENSE file in the directory above.
 It is not only this project's code. It is compiled with Microsoft Visual C++
 6.0 and linked against that compiler's STATIC C runtime - the build passes no
 /MD - so those runtime modules are bound into this executable rather than
-loaded from a DLL when it runs. That is deliberate: it is what makes the tool a
-single file that works on a Windows 98 SE machine with nothing installed on it,
-which is the machine it exists for. You can see it for yourself in the import
-table, which names only KERNEL32.dll and ADVAPI32.dll and no C runtime DLL.
+loaded from a DLL when it runs. That is deliberate: it is what makes the
+tool a single file that works on a Windows 98 SE machine with nothing
+installed on it, which is the machine it exists for. You can see it for
+yourself in the import table, which names only KERNEL32.dll and ADVAPI32.dll
+and no C runtime DLL.
 
 Those runtime modules are Microsoft's. They are not covered by the GPL grant
 above, and they keep whatever terms accompany Visual C++ 6.0. What this file
@@ -2984,8 +3346,8 @@ No DOS extender and no Open Watcom code is in this executable; the NOTICE.TXT
 beside XHCIQUAL.EXE covers a different program and does not apply here.
 '@
         $snapNotice = $snapNotice.Replace("{VERSION}", $Version)
-        Write-AsciiFile -Path (Join-Path $snaptoolStaged "NOTICE.TXT") `
-                        -Lines ($snapNotice -split "`r?`n")
+        Write-GeneratedText -Path (Join-Path $snaptoolStaged "NOTICE.TXT") `
+                            -Lines ($snapNotice -split "`r?`n")
         Write-Ok "NOTICE.TXT written beside XHCISNAP.EXE (static MSVC 6.0 C runtime)"
     }
 
@@ -3087,8 +3449,8 @@ after checkout. Restore it with:  git checkout -- LICENSE
     # `releases\<version>\` is the tracked half. The download a user gets is
     # the same tree, zipped, with each flavour directory gated as install
     # media on the way. Since 1.0.0.1 it carries no Microsoft file: the OS
-    # supplies usbd.sys and usbhub.sys through the INF's LayoutFile. See
-    # docs\contributing\legal-provenance.md section 5.
+    # supplies usbd.sys, usbhub.sys and usbui.dll through the INF's
+    # LayoutFile. See docs\contributing\legal-provenance.md section 5.
     $uploadRoot = $null
     $uploadZip = $null
     if (-not $SkipUploadSet) {

@@ -72,19 +72,19 @@ Notes:
 
     Appendix H.1 settles the other half: it lists the capabilities "that were optional for xHCI 1.0 implementations [and] are now required in xHCI 1.1 implementations", and H.1.6 is FSC (p.593), as are U3C (H.1.4), CTC (H.1.7) and CIC (H.1.8), three more bits of this same register. So a 1.0 controller may legitimately advertise FSC, and a driver that forces the bit to 0 on an HCIVERSION test is discarding a discovery bit. `src/xhci_caps.c` gates the read on reach instead (CAPLENGTH and the mapped window must both extend to 0x20), which is checkable rather than inferred.
   - What remains an inference: the PDF does not say what a controller predating the register returns at that address. With the reach gate the exposure is a controller whose CAPLENGTH covers 0x20 and which implements nothing there. The convention that such a read is 0 is a backward-compatibility assumption, not spec text; do not restate it as a requirement. An all-ones read is refused separately, since bit 2 of it is a 1.
-  - QEMU's model has no HCCPARAMS2 case at all and its capability reads default to 0, so FSC reads 0 there. That one is measured. The fleet controllers are not measured: `xhciqual` reads and prints HCCPARAMS2 and decodes FSC (`xhciqual/xhcicap.c`, `xhciqual/report.c`), but `xhciqual/results/` predates that change, so what it establishes for the fleet is HCIVERSION and CAPLENGTH and nothing about their FSC bit. Closing the gap needs a fresh bare-metal run, not a code change. Do not infer one controller's answer from another's.
+  - QEMU's model has no HCCPARAMS2 case at all and its capability reads default to 0, so FSC reads 0 there. That one is measured. The fleet is measured in part. `xhciqual` reads and prints HCCPARAMS2 and decodes FSC (`xhciqual/xhcicap.c`, `xhciqual/report.c`), and the E460 logs of 2026-08-22 carry it: `HCCPARAMS2 00000000`, `fsc=0` in the `FACT` line, corroborated at stage E0 of `runs/run-13e.md`. What predates the change is the two 2026-07-25 sets, the earlier E460 one and the P14s one, which establish HCIVERSION and CAPLENGTH and nothing about their FSC bit. Closing that half needs a fresh bare-metal run on the P14s, not a code change. Do not infer one controller's answer from another's.
 
 ## 3. Operational Registers (BAR0 + CAPLENGTH, spec 5.4)
 
 | Offset | Register | Bits used by this driver |
 |---|---|---|
-| +0x00 | USBCMD | R/S `0`, HCRST `1`, INTE `2`, HSEE `3`, RsvdP `6:4`, LHCRST `7`, CSS `8`, CRS `9`, EWE `10`, EU3S `11` |
+| +0x00 | USBCMD | R/S `0`, HCRST `1`, INTE `2`, HSEE `3`, RsvdP `6:4`, LHCRST `7`, CSS `8`, CRS `9`, EWE `10`, EU3S `11`, then the 1.1/1.2 additions CME `13`, ETE `14`, TSC_EN `15` and VTIOE `16` - defined bits this driver never enables and always writes as zero, which is why `XHCI_USBCMD_DEFINED_MASK` in `src/xhci.h` covers `16:0` and not just `11:0` |
 | +0x04 | USBSTS | HCH `0` (RO), HSE `2` (RW1C), EINT `3` (RW1C), PCD `4` (RW1C), SSS `8`, RSS `9`, SRE `10` (RW1C), CNR `11` (RO), HCE `12` (RO) |
 | +0x08 | PAGESIZE | Bit n set => page size 2^(n+12). Bit 0 = 4 KB (the normal case) |
 | +0x14 | DNCTRL | Notification Enable N0-N15 `15:0`, RsvdP `31:16` (Table 5-23 p.366). Write 0x0002 (enable FUNCTION_WAKE only, spec 5.4.4 Table 5-23 note; Function Wake is 4.13.2) or 0 |
 | +0x18 | CRCR (64-bit) | RCS `0`, CS `1` (RW1S), CA `2` (RW1S), CRR `3` (RO), RsvdP `5:4`, Command Ring Pointer `63:6` (Table 5-24 p.367-368) |
 | +0x30 | DCBAAP (64-bit) | Pointer `63:6`, low 6 bits RsvdZ - write 0, do not preserve (Table 5-25 p.369) |
-| +0x38 | CONFIG | MaxSlotsEn `7:0`, U3E `8`, CIE `9`, SOC `10` (RW, new in revision 1.2c; RsvdP in 1.2), RsvdP `31:11` (Table 5-26 p.370). This driver never sets SOC and its read-modify-write carries whatever it read, so the bit's promotion changed nothing |
+| +0x38 | CONFIG | MaxSlotsEn `7:0`, U3E `8`, CIE `9`, SOC `10` (RW, new in revision 1.2c; RsvdP in 1.2), RsvdP `31:11` (Table 5-26 p.370). This driver never sets SOC and its read-modify-write carries whatever it read, so the bit's promotion changed nothing - and the write behaviour is the same either way, which is why `xhci-programming.md`'s step 6 can call `31:10` RsvdP without any consequence following from the difference |
 | +0x400 + 0x10*(n-1) | PORTSC for port n (1-based) | See below |
 
 USBSTS is RW1C: to clear EINT write a value with bit 3 set. **Never
@@ -148,8 +148,9 @@ p.392).
 
 Safe-write rule (also in `docs/usb-xhci-info/xhci-programming.md`): build the
 value from the read, clear PED + PR + WPR + all RW1C change bits (`17:23`) +
-LWS, then OR in the one bit being changed. After PP 0->1, wait 20 ms before
-touching the port (spec 5.4.8 note).
+LWS + the RsvdZ bits (`2` and `29:28`, which `XHCI_PORTSC_UNSAFE_MASK`
+includes), then OR in the one bit being changed. After PP 0->1, wait 20 ms
+before touching the port (spec 5.4.8 note).
 
 Both reset strobes are cleared, not just PR. WPR is bit 31 and RW1S: "when
 software writes a `1` to this bit, the Warm Reset sequence as defined in the
@@ -347,14 +348,14 @@ is VM-observable and only the success path is bare-metal-only.
 | +0x30 + 32*n | IR[n].ERSTBA (64-bit) | RsvdP `5:0`, ERST base `63:6` (Table 5-41 p.394) |
 | +0x38 + 32*n | IR[n].ERDP (64-bit) | DESI `2:0`, EHB `3` (RW1C), dequeue pointer `63:4`. No reserved field (Table 5-42 p.394) |
 
-ISR/DPC rules:
+#### ISR/DPC rules
 
 - ISR: read USBSTS; if EINT = 0 the interrupt is not ours. Clear EINT (write 1), then clear IMAN.IP (write IMAN with IP = 1). Both are RW1C. EINT is a summary of IP 0->1 transitions, not the INTx line source; IMAN.IP holds INTx asserted. Acknowledge this pair once and defer Event Ring work. Do not copy a generic PCI ISR's status-drain loop into the xHCI path.
   - This driver's ISR writes IE as 0, not as 1. That costs no delivery: the xHC sets EHB when it sets IP and cannot set IP again while EHB is set, so no interrupt can be generated in the window the ISR opens whatever IE holds. What it buys is that the ISR, which runs at DIRQL and cannot take the miniport's DISPATCH-level controller lock, moves IE in the same direction every masking path does, so it can never re-publish an enable a concurrent mask has just cleared. IE is re-raised only by the DPC's re-arm, under the lock and only while usbport still wants interrupts. See `docs/contributing/implementation-invariants.md`, "Interrupt Ordering", and `src/xhci_evt.c` (`XhciIsr`).
 - DPC: after draining events, write ERDP = (current dequeue physical address) | EHB(bit 3) to clear Event Handler Busy. EHB gating is architectural, not controller-specific: the xHC sets EHB = 1 whenever it sets IP, and IP shall not be set again while EHB = 1 (spec 4.17.2 interrupt-assertion conditions, 4.17.5 IP rules, 5.5.2.3.3 EHB field). A drain in progress therefore cannot be re-interrupted by its own interrupter, and forgetting the final EHB = 1 write silences the interrupter permanently.
 - During a long drain, also write ERDP periodically (e.g. every 32 events), not only at the end: the xHC detects a full event ring from the software-advertised dequeue pointer, so a stale ERDP during an event burst causes Event Ring Full (completion code 21) even though the DPC is consuming events. EHB is RW1C, so put 0 in bit 3 on these intermediate writes. That preserves EHB = 1, keeping interrupts suppressed mid-drain; writing 1 would clear it. Only the final write after the ring is empty carries bit 3 = 1.
 - With PCI pin-based interrupts (this driver's only mode), the INTx line stays asserted while IMAN.IP = 1 (spec 5.5.2.1). It is a level-triggered line, so clearing IP in the ISR is mandatory or the machine hangs in an interrupt storm.
-- IMOD: leave default (4000 = 1 ms moderation) initially; lower it later only if HID latency is an issue.
+- IMOD: leave default (4000 = 1 ms moderation) initially; lower it later only if HID latency is an issue. The start never writes it; the one write is the Save/Restore resume path, which writes back the value read at the save (the restore list below requires IMOD to be written before CRS). It wrote 0 there until the 2026-09-05 audit's F10, silently removing the moderation the isochronous builder's IOC-per-TD policy relies on after every successful restore.
 
 ## 5. Doorbell Registers (BAR0 + DBOFF, spec 5.6)
 
@@ -384,7 +385,7 @@ Each capability header DWORD: `Capability ID 7:0`, `Next Capability Pointer
 ### USB Legacy Support (USBLEGSUP, spec 7.1.1)
 
 - DW0 (the capability header DWORD itself): ID `7:0` = 1, Next `15:8`, HC BIOS Owned Semaphore `16`, HC OS Owned Semaphore `24`.
-- DW1 (offset +4, USBLEGCTLSTS, spec 7.1.2): SMI enable bits in `15:0` (bit 0 = USB SMI Enable, bit 4 = SMI on Host System Error, bit 13 = SMI on OS Ownership Enable, bit 14 = SMI on PCI Command, bit 15 = SMI on BAR), status/RW1C bits in `31:16` (bit 29 = SMI on OS Ownership Change, 30 = SMI on PCI Command, 31 = SMI on BAR).
+- DW1 (offset +4, USBLEGCTLSTS, spec 7.1.2, Table 7-5): the SMI enables are five bits, not the whole low half - bit 0 = USB SMI Enable, bit 4 = SMI on Host System Error Enable, bit 13 = SMI on OS Ownership Enable, bit 14 = SMI on PCI Command Enable, bit 15 = SMI on BAR Enable (mask `0x0000E011`). Bits `3:1`, `12:5` and `19:17` are RsvdP and must be written back as read (mask `0x000E1FEE`); bit 16 (SMI on Event Interrupt) and bit 20 (SMI on Host System Error) are read-only status; `28:21` are RsvdZ; `31:29` are RW1C status (bit 29 = SMI on OS Ownership Change, 30 = SMI on PCI Command, 31 = SMI on BAR). The handoff's write used a blanket `0xFFFF` enable mask and zeroed the RsvdP fields until the 2026-09-05 audit's F13.
 
 Handoff: set DW0 bit 24; poll until bit 16 clears (~1 s timeout, proceed with a
 warning on timeout); then write DW1 clearing all enable bits in `15:0` and
@@ -573,9 +574,11 @@ a burst count into the TD Size field of every Isoch TRB.
 
 Link (type 6, spec 6.4.4.1): DW0/1 = next segment pointer (16-byte aligned); DW3: C `0`, TC `1` (Toggle Cycle; set on the wrap-back link of a single-segment ring), CH `4`, Type `15:10` = 6.
 
-TD composition and Link placement (spec 4.11.7, p.212; Link TRB notes p.208;
-CH field description p.464), transcribed because a TD that spans the
-wrap-back Link TRB has to obey all of it:
+#### TD composition and Link placement
+
+Spec 4.11.7, p.212; Link TRB notes p.208; CH field description p.464,
+transcribed because a TD that spans the wrap-back Link TRB has to obey all of
+it:
 
 - "The TRB Chain flag is used [to] identify the TRBs of a TD, where the Chain
   flag is set in all the TRBs of a TD except the last." A Link TRB inside a TD
@@ -982,8 +985,9 @@ a generation, so once those TRBs are re-let the tail is indistinguishable from
 the new TD's own event and completes it with the wrong length: a truncated bulk
 IN reported as success. So the short event only defers. The transfer stays
 queued and keeps its TRBs, and the retire happens at the end of a drain pass
-that found the event ring empty (`XhciXferDrainSettled`, called from
-`XhciEventDpc` only when that pass observed the ring empty). At that instant
+that found the event ring empty (`XhciXferDrainSettled`, reached from
+`XhciEventDpc` only when that pass observed the ring empty - one level down,
+through `XhciSlotDrainSettled`, which is what the DPC actually calls). At that instant
 every tail the controller had written has been consumed and matched, so a TD
 still short is one whose tail was not sent.
 
@@ -1194,7 +1198,7 @@ Input Control Context (spec 6.2.5.1):
 |---|---|
 | 0 | Drop Context flags D2-D31 (bits `31:2`; bits 0-1 RsvdZ) - contexts to disable |
 | 1 | Add Context flags A0-A31 (bit i = context DCI i) - contexts to evaluate/enable |
-| 7 | Configuration Value `7:0`, Interface Number `15:8`, Alternate Setting `23:16` (only if HCCPARAMS1.CFC = 1; otherwise RsvdZ - leave 0) |
+| 7 | Configuration Value `7:0`, Interface Number `15:8`, Alternate Setting `23:16`. These are valid only when HCCPARAMS2.CIC = 1 **and** CONFIG.CIE is set; otherwise RsvdZ - leave 0. (CIC is Configuration Information Capability, HCCPARAMS2 bit 5, listed in Appendix H.1.8 as one of the bits that became required at xHCI 1.1. It is NOT HCCPARAMS1.CFC, which is Contiguous Frame ID and is described in section 5.) This driver never writes DW7 and never sets CONFIG.CIE, so it leaves the whole doubleword zero |
 
 Usage: Address Device sets A0 + A1 (slot + EP0). Configure Endpoint sets A0
 plus one A-bit per endpoint being added and D-bits for endpoints being

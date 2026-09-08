@@ -261,9 +261,12 @@ conversion that follows from it.
 
 Miniport callbacks that return `MPSTATUS` use: `MP_STATUS_SUCCESS 0`,
 `MP_STATUS_FAILURE 1`, `MP_STATUS_NO_RESOURCES 2`, `MP_STATUS_NO_BANDWIDTH 3`
-(map xHCI Resource Error / Bandwidth Error / Secondary Bandwidth Error here so
-usbhub degrades gracefully; not No Slots Available, which belongs to Enable
-Slot),
+(where a synchronous miniport would map xHCI Resource Error / Bandwidth Error /
+Secondary Bandwidth Error so usbhub degrades gracefully; not No Slots
+Available, which belongs to Enable Slot. This driver never returns it: its
+Configure Endpoint is asynchronous, so the refusal is carried to the next
+`SubmitTransfer` and completed as `USBD_STATUS_NO_BANDWIDTH` instead - see
+`usbport-miniport-interface.md`, "Endpoints"),
 `MP_STATUS_ERROR 4`, `MP_STATUS_RESERVED1 5`, `MP_STATUS_NOT_SUPPORTED 6`,
 `MP_STATUS_HW_ERROR 7`, `MP_STATUS_UNSUCCESSFUL 8`. usbport treats any
 nonzero `StartController` return as failure [usbport/pnp.c:856].
@@ -350,7 +353,7 @@ writes back ("out"):
 | 0x18 | `MiniPortTransferSize` | in | `sizeof(XHCI_TRANSFER)` |
 | 0x1C | `Reserved2` | - | sentinel-fill |
 | 0x20 | `Reserved3` | - | sentinel-fill |
-| 0x24 | `MiniPortResourcesSize` | in | Controller common-buffer block: DCBAA + cmd ring + ERST + event ring + scratchpad (delivered via `USBPORT_RESOURCES.StartVA/StartPA`) |
+| 0x24 | `MiniPortResourcesSize` | in | Controller common-buffer block, delivered via `USBPORT_RESOURCES.StartVA/StartPA`: DCBAA + scratchpad buffer array, command ring + ERST, event ring, the input context, 32 device contexts, 32 EP0 rings and the pool rings, then the scratchpad pages - the full list is `XHCI_REGION_*` in `src/xhci.h`, and `XHCI_HC_RESOURCES_SIZE` is the number DriverEntry commits |
 | 0x28 | `OpenEndpoint` | in | 26 miniport callbacks, in declaration order |
 | 0x2C | `ReopenEndpoint` | in | |
 | 0x30 | `QueryEndpointRequirements` | in | |
@@ -499,7 +502,7 @@ The opaque `PVOID` arguments follow one convention everywhere:
 | `InterruptNextSOF` | `VOID (ext)` [245-246] | No call site in the ReactOS mirror, but both shipping builds have two; see "`InterruptNextSOF`: what it asks for, and what happens when nothing answers" below. One argument, return value ignored, DISPATCH_LEVEL holding `MiniportSpinLock` and nothing else. Both sites belong to the endpoint state-change machine: the tail of `USBPORT_SetEndpointState`, and the walker that drains the state-change list when it cannot yet retire the head. usbport never waits on it (the same list is drained unconditionally by a self-rearming 500 ms timer DPC), so a do-nothing stub costs latency and nothing else. What the drain depends on is `Get32BitFrameNumber` advancing, not this callback |
 | `PollController` | `VOID (ext)` [254-255] | No call site found in mirror (polling-mode path). Benign stub |
 | `ResetController` | `VOID (ext)` [274-275] | Paired with `UsbPortInvalidateController(RESET)`. Confirmed in both shipping builds, and it is not a PASSIVE-level re-init slot: the invalidation queues a DPC, and that DPC takes `KfAcquireSpinLock` on `FdoExtension+0x288` (NUSB) / `+0x28C` (SP4), calls this slot, and releases it (NUSB `00011AC4`/`00011B36`/`00011B42`, SP4 `00011B80`/`00011BF2`/`00011BFE`). So it runs at DISPATCH_LEVEL inside one of usbport's spin locks, where `KeDelayExecutionThread` (i.e. `UsbPortWait`) is illegal. usbport does nothing after the call but release the lock and drop a busy reference, so a miniport may decline the work; it may not reinitialize here. And usbport never comes back: no timer, watchdog or transfer path in either image reaches `StopController`/`StartController`; only a PnP or power IRP does (the census two notes below). Nor does usbport ever request the reset itself; the only producer of `Type == 1` is a miniport. See the notes below |
-| `FlushInterrupts` | `VOID (ext)` [515-516] | No call site in the ReactOS mirror, but all three shipping builds have one; see "`FlushInterrupts`: the call site the mirror does not have" below. Called from the device-power completion routine on the successful `PowerDeviceD0` path, before `TakePortControl` and before resume processing, holding neither miniport lock. EHCI implements it as "ack all pending status bits" [usbehci.c:3579-3593]. The xHCI miniport does nothing to the hardware, because any acknowledgement it could make is inseparable from an `ERDP` write, and this is the one caller that cannot hold the controller lock every `ERDP` writer holds (design doc 05 section 5) while the DPC can be running on another CPU |
+| `FlushInterrupts` | `VOID (ext)` [515-516] | No call site in the ReactOS mirror, but all three shipping builds have one; see "`FlushInterrupts`: the call site the mirror does not have" below. Called from the device-power completion routine on the successful `PowerDeviceD0` path, before `TakePortControl` and before resume processing, holding neither miniport lock. EHCI implements it as "ack all pending status bits" [usbehci.c:3579-3593]. The xHCI miniport does nothing to the hardware: taking the controller lock here would be legal (design doc 05 section 5), but there is nothing to do at this call site - the controller is halted and masked by the suspend, and the resume owns the pending event state on both of its paths (HCRST on the reinitialising one, `XhciEventDiscardStale` on the restoring one) |
 | `TakePortControl` | `VOID (ext)` [523-524] | EHCI leaves it unimplemented [usbehci.c:3595-3600]. Companion-controller handback - N/A for xHCI. Reached from the same D0 completion as `FlushInterrupts`, gated on `MiniPortFlags & USB_MINIPORT_FLAGS_USB2` in all three builds and additionally on interface `Version >= 200` in the Win2000/XP builds |
 
 #### `UsbPortInvalidateController(RESET)`: real in the binaries, a `FIXME` in the mirror
@@ -694,7 +697,10 @@ usbport's own internal use of that routine is a single site, and it is not
 surprise-removal path, pushes 2. So nothing inside usbport ever requests a
 controller reset. The only producer of `Type == 1` is a miniport calling the
 published service. In this driver that is `XhciRequestControllerReset`
-(`src/xhci_cmd.c`), on a command timeout, so the whole `ResetController` loop
+(`src/xhci_cmd.c`), reached from five places: the command engine's abort
+ladder (`xhci_cmd.c`), the fatal-status escalation on HCE/HSE and the two
+interrupt enable/disable paths whose write could not be proven (`xhci_evt.c`),
+and the health poll (`xhci_dispatch.c`), so the whole `ResetController` loop
 is this driver asking usbport to call this driver back, with usbport
 contributing the DPC and the lock and nothing else.
 
@@ -794,9 +800,14 @@ The routine acquires no spin lock at all, neither `MiniportSpinLock` nor
 `MiniportInterruptsSpinLock`; `grep KfAcquireSpinLock` over any of the three
 extracts returns nothing. So `FlushInterrupts` can run concurrently with
 `InterruptDpc` on SMP. So `xhci98.sys` implements it as a counter and nothing
-else (`XhciFlushInterrupts` in `src/xhci_evt.c`): the acknowledgement it would
-otherwise make is inseparable from an `ERDP` write, and this caller cannot
-hold the controller lock every `ERDP` writer holds.
+else (`XhciFlushInterrupts` in `src/xhci_evt.c`). Not because the caller
+could not take the controller lock - it could, legally, from this arbitrary
+thread (design record 05 section 5) - but because there is nothing to do at
+this call site: it runs from the D0 power completion before resume processing,
+on a controller suspend has halted and masked, and the resume owns whatever
+pending event state there is on both of its paths (the reinitialising one
+through HCRST, the restoring one through `XhciEventDiscardStale` before the
+enables return).
 
 Nothing is lost by that at this call site, even though something may be
 pending: `IP` and `EINT` survive a mask by design (the miniport writes `IP` as
@@ -854,7 +865,7 @@ Locks and IRQL. Each site acquires `MiniportSpinLock` (SP4 `devExt+0x28C`,
 NUSB `devExt+0x288`) with `KfAcquireSpinLock` for this call alone and
 releases it immediately after, so the callback runs at DISPATCH_LEVEL under
 one lock: the same one `SetEndpointState` and `Get32BitFrameNumber` are called
-under, and the same one this driver's `XhciControllerLock` nests inside. The
+under, and the same one this driver's `xhciControllerLock` (reached through `XhciControllerLockAcquire`/`Release`, `src/xhci_cmd.c`) nests inside. The
 endpoint's own locks (`Endpoint+0xD4`, `Endpoint+0xB8`) are released before
 the call at both sites, and the state-change list's lock is not held either.
 Site B additionally holds the walker's re-entrancy claim (`devExt+0x110`,
@@ -1118,8 +1129,10 @@ than reported: a per-packet status of `0xC0000009` is stored to the URB, then
 logged and replaced with 0. `URB->ErrorCount` (`URB+0x50`) is incremented for
 every packet whose URB status is nonzero after that rewrite, so a rewritten
 one is not counted as an error. The constant is recorded as measured; this file
-does not name it, because `AGENTS.md` forbids naming a `USBD_STATUS` from
-memory.
+does not name it, because a `USBD_STATUS` value written down from memory
+rather than read out of the DDK header or a binary is exactly the mistake
+batch 6-A had to undo three times (`src/xhci_xfer.h` records which). That is a
+habit this project keeps, not a rule `AGENTS.md` states.
 
 Three things the tables above do not cover, and how the driver handles each:
 
@@ -1431,6 +1444,18 @@ carries the full annotation, the NUSB one records agreement and difference.
   not the miniport's: `USBD_STATUS_DEVICE_GONE` (`0xC0007000`) if the endpoint
   is NUKEd or the transfer is flagged `DEVICE_GONE`, else
   `USBD_STATUS_CANCELED` (`0xC0010000`).
+  - **That is not the value this driver uses, and the difference is real.**
+    `src/xhci_xfer.h` and `xhci-programming.md`'s completion-code table use
+    `USBD_STATUS_CANCELED = 0x00010000`, which is what the Windows 2000 DDK's
+    `usbdi.h` defines and is in the SUCCESS class (top two bits 00). The
+    `0xC0010000` above is what usbport itself selects when IT cancels, and is
+    in the error class (top two bits 11). So a miniport-side cancellation and
+    a usbport-side one reach a client as different status classes carrying
+    the same name. Nothing in this driver depends on which is seen - usbport
+    overwrites the URB status on the paths where it chooses its own - but do
+    not "fix" either constant to match the other, and do not read a
+    `0x00010000` in a trace as usbport's doing. Which of the two a client
+    actually observes, per path, has not been measured.
 - There is also an ISO-only early return before any abort: if the
   transfer's last frame has not passed yet, the whole pass returns and retries
   later. The threshold is `StartFrame + NumberOfPackets + 1`, not the sum -
@@ -1753,8 +1778,8 @@ prints the same RVAs, so no Visual Studio install is needed to repeat it.
 |---|---|---|
 | `RH_GetRootHubData` | `VOID (ext, PVOID data)` [278-281] | Arg 2 is `PUSBPORT_ROOT_HUB_DATA` (section 5) [roothub.c:1013-1016]. Report only managed USB2 ports - but `NumberOfPorts` must be >= 1: ReactOS `USBPORT_RootHubCreateDevice` asserts it is nonzero before sizing the removable/power masks as `(NumberOfPorts - 1) / 8 + 1` [roothub.c:787-794]; both shipping binaries have no such assertion and go straight into the arithmetic (confirmed). At zero it unsigned-wraps to `0x20000000` mask bytes, so the descriptor allocation asks for ~1 GB. The instructions then null-check the result and build no PDO on the null branch - they cannot show what the allocator returns, so "it fails" is the expectation, not the proof. A miniport that does not yet know its port count must report a synthetic port, not zero (the Phase 3 stub reports one permanently disconnected port) |
 | `RH_GetStatus` | `MPSTATUS (ext, PUSHORT)` [283-286] | Constant "self-powered hub OK". The one root-hub callback reached through the standard command path (device GET_STATUS) rather than the class one [roothub.c:397-415], and its return goes through the same `MPSTATUS` -> `RHSTATUS` mapping, so the section 2 table applies here too |
-| `RH_GetPortStatus` | `MPSTATUS (ext, USHORT Port, PUSB_PORT_STATUS_AND_CHANGE)` [290-294] | `Port` is the raw hub-class `wIndex`: 1-based, validated against `bNumberOfPorts` before the call [roothub.c:124-152] - but not on the status-change-endpoint path, which walks 1..`bNumberOfPorts` itself [roothub.c:603-627]. Output is the standard USB hub port status/change bitmap (4 bytes). Return `MP_STATUS_SUCCESS` even when there is nothing to report: any nonzero return aborts that whole SCE scan with `RH_STATUS_UNSUCCESSFUL` [roothub.c:604-614], stalling the root hub's change pipe on every poll |
-| `RH_GetHubStatus` | `MPSTATUS (ext, PUSB_HUB_STATUS_AND_CHANGE)` [296-299] | Constant zeros. Same two-path story as `RH_GetPortStatus` above: mapped through section 2's table on the class GET_STATUS path [roothub.c:160], but tested directly by the status-change endpoint [roothub.c:630, 657], where a nonzero return abandons the whole scan with `RH_STATUS_UNSUCCESSFUL`. Return `MP_STATUS_SUCCESS` even when reporting no changes |
+| `RH_GetPortStatus` | `MPSTATUS (ext, USHORT Port, PUSB_PORT_STATUS_AND_CHANGE)` [290-294] (ReactOS's spelling; `src/xhci_usbport.h` calls the same 4-byte type `PUSBPORT_PORT_STATUS_AND_CHANGE`) | `Port` is the raw hub-class `wIndex`: 1-based, validated against `bNumberOfPorts` before the call [roothub.c:124-152] - but not on the status-change-endpoint path, which walks 1..`bNumberOfPorts` itself [roothub.c:603-627]. Output is the standard USB hub port status/change bitmap (4 bytes). Return `MP_STATUS_SUCCESS` even when there is nothing to report: any nonzero return aborts that whole SCE scan with `RH_STATUS_UNSUCCESSFUL` [roothub.c:604-614], stalling the root hub's change pipe on every poll |
+| `RH_GetHubStatus` | `MPSTATUS (ext, PUSB_HUB_STATUS_AND_CHANGE)` [296-299] (`PUSBPORT_HUB_STATUS_AND_CHANGE` in `src/xhci_usbport.h`) | Constant zeros. Same two-path story as `RH_GetPortStatus` above: mapped through section 2's table on the class GET_STATUS path [roothub.c:160], but tested directly by the status-change endpoint [roothub.c:630, 657], where a nonzero return abandons the whole scan with `RH_STATUS_UNSUCCESSFUL`. Return `MP_STATUS_SUCCESS` even when reporting no changes |
 | `RH_SetFeature...` / `RH_ClearFeature...` (12 entries: 4 Set + 8 Clear, packet `0xA0`-`0xCC`) | `MPSTATUS (ext, USHORT Port)` [301-359] | Port is 1-based on the ordinary class-command routing, which validates it against `bNumberOfPorts` first - but not universally: SP4's hub-directed path passes `Port = 0` to `RH_ClearFeaturePortOvercurrentChange` (`0x207EC` pushes zero, `0x207F3` calls packet `0xCC`), so that callback must tolerate 0 rather than index with it. Feature routing done by usbport from the hub SETUP packet [roothub.c:126-171ff]. Refuse an unsupported operation with `MP_STATUS_NOT_SUPPORTED`, never `MP_STATUS_FAILURE`; see the status-mapping table in section 2. Note `SET_FEATURE(PORT_POWER)` reaches a USB2 miniport through `USBPORT_RH_SetFeatureUSB2PortPower` [roothub.c:33-97], which powers every companion controller's ports first and discards the miniport's return; the root-hub startup power/chirp loop discards it too [roothub.c:989-992]. ReactOS calls these at DISPATCH_LEVEL without `MiniportSpinLock` [roothub.c:170-285], so they must not block and must use miniport-owned synchronization for shared state. A lock does appear on the USB2 port-power path, but the helper drops it before the callback: `USBPORT_RH_SetFeatureUSB2PortPower` calls a helper that acquires at SP4 `0x27AED` and releases at `0x27C3C`, returning at `0x27C49`, and only then invokes `RH_SetFeaturePortPower` at `0x22ADE`/`0x22B0A`; NUSB is identical. That is a statement about *this helper*, not about callback entry in general: caller-held locking remains unverified, so "usbport does not serialize these" stays unsupported either way - use miniport-owned synchronization. Reset: set PORTSC.PR, arm a `UsbPortRequestAsyncCallback` timeout, return, and report completion through the change bit when PRC arrives (the ReactOS EHCI miniport uses this same asynchronous shape [usbehci/roothub.c:364-394]). Because the timer cannot be cancelled, pass a reset generation and let only the matching still-armed PRC/timeout path claim completion |
 | `RH_DisableIrq` / `RH_EnableIrq` | `VOID (ext)` [361-365] | Lifecycle read from the binaries: `USBPORT_InvalidateRootHub` calls `RH_DisableIrq`, and each image has a second disable site; the status-change scan calls `RH_EnableIrq` on its no-changes exit only - success, error, and the early return all bypass it - and that is the only enable site in each image, so a close is not guaranteed a matching open. Not shown, and not claimed: that every scan is preceded by a disable (each image also dispatches one with none). Per-build addresses, since these differ: SP4 enable `0x215F4`, disables `0x21C56` and `0x1D6C9`, unpaired dispatch `0x218FB`; NUSB enable `0x20F82`, disables `0x215E4` and `0x1D265`, unpaired dispatch `0x21289`. Project decision (from that lifecycle plus the xHCI argument that `IMAN.IE` gates the whole interrupter, not from the disassembly): implement as a pure software gate on whether a port change calls `UsbPortInvalidateRootHub`, hold no state that only an `RH_EnableIrq` could release, and never touch `IMAN.IE`, which would silence transfer completions too |
 | `RH_ChirpRootPort` | `MPSTATUS (ext, USHORT Port)` [518-521] | Called once per port at root-hub start, after powering companion-controller ports [roothub.c:995-1042]. The return is discarded. The gating is not the same on both targets: SP4 waits 100 ms (`0x22C55`) and gates on a literal interface `Version >= 0xC8` (`0x22CBB`) before calling at `0x22CCE`, matching ReactOS; NUSB does neither - no wait, no `Version` compare (its wrapper has no `Version` field), reaching packet `0x12C` at `0x22623` gated only on an internal `+0x48` bit tested at `0x225FC`, with no null check on the slot. Do not rely on the settle wait. Both builds withhold the slot below Version 200 at *registration*, so the version rule holds either way - but on NUSB it is the only thing standing between a sub-200 miniport and a null call. Register at 200. EHCI-specific HS handshake; for xHCI return success without bus action |
@@ -2038,7 +2063,7 @@ tool using this route should check the route before trusting its absence.
 | 0x10 | `InterruptAffinity` | KAFFINITY | |
 | 0x14 | `ShareVector` | BOOLEAN + 3 pad | |
 | 0x18 | `InterruptMode` | enum | LevelSensitive for PCI INTx |
-| 0x1C | `Reserved` | ULONG_PTR | |
+| 0x1C | `Reserved` | ULONG (`ULONG_PTR` in ReactOS; the same width on x86, and `src/xhci_usbport.h` spells it `ULONG`) | |
 | 0x20 | `ResourceBase` | PVOID | Mapped VA of BAR0 - use directly, do not map anything [usbehci.c:1182] |
 | 0x24 | `IoSpaceLength` | ULONG | BAR length |
 | 0x28 | `StartVA` | ULONG_PTR | VA of the `MiniPortResourcesSize` common buffer [pnp.c:826] |
@@ -2048,7 +2073,11 @@ tool using this route should check the route before trusting its absence.
 | 0x32 | `Reserved2/3` | UCHAR x2 | |
 
 The EHCI pattern for the common-buffer block - a single struct
-(`EHCI_HC_RESOURCES`) whose `sizeof` is `MiniPortResourcesSize`, carved via
+(`EHCI_HC_RESOURCES`) whose `sizeof` is `MiniPortResourcesSize` - this
+driver's equivalent is `XHCI_HC_RESOURCES_SIZE`, covering DCBAA + scratchpad buffer array, command ring + ERST, event ring, the input
+context, 32 device contexts, 32 EP0 rings and the pool rings, then the
+scratchpad pages - the full list is `XHCI_REGION_*` in `src/xhci.h`, and
+`XHCI_HC_RESOURCES_SIZE` is the number DriverEntry commits - carved via
 `FIELD_OFFSET` from `StartVA`/`StartPA` [usbehci.c:889-975, 3639] - is the
 model for the xHCI block (DCBAA, command ring, ERST, event ring, scratchpad
 array; scratchpad pages need their own PAGESIZE alignment, so place them last
@@ -2765,7 +2794,10 @@ key, which is what a plain `AddReg` under an INF's install section writes.
 The miniport needs no import of its own for any of this. The `Zw*` calls,
 the pool allocation and the string work are all inside `usbport.sys`. That is
 the property that makes this the only registry channel this project may use -
-`scripts/import-gate/xhci98-imports.allow` denies the `Zw*` names outright.
+`scripts/import-gate/xhci98-imports.allow` admits no `Zw*` name. The
+allowlist has no deny list: a name is refused by not being on it, which is
+why the file's remaining `Zw*` mentions are the removal note for task
+11-V.7's three file-sink imports rather than rules.
 
 ## 7. Locking, IRQL, and threading summary
 
@@ -2779,7 +2811,7 @@ state goes - is derived from this table in
 |---|---|
 | `MiniportSpinLock` | usbport's lock around endpoint open/close/state/submit/abort, `CheckController`, `Get32BitFrameNumber`, Enable/DisableInterrupts, and the root-hub status-query callbacks. The root-hub Set/Clear feature callbacks are a documented exception in ReactOS: they run at DISPATCH_LEVEL without this lock. Evidence: [endpoint.c:762-783, 1049-1055, 1218-1247, 1495-1502, 1564-1587; usbport.c:568-585, 1177-1184; roothub.c:148-164, 170-285] |
 | `MiniportInterruptsSpinLock` | Separate lock held (at DPC level) around `InterruptDpc` [usbport.c:1089-1095]. Implication: `InterruptDpc` can run concurrently with a `MiniportSpinLock`-holding callback - the miniport needs its own interior lock for structures shared between the DPC path and the submit path (ring enqueue/dequeue state) |
-| Async timer DPC | `UsbPortRequestAsyncCallback` callbacks run at DISPATCH_LEVEL without either usbport miniport lock [usbport.c:2089-2109], confirmed in the NUSB binary at `0002785E`. They can race `InterruptDpc` and callback paths on SMP, and can run stale after the operation completed - including after a stop and a restart, since nothing can cancel one and usbport zeroes the miniport extension before every start. Validate a token that does *not* live in that extension before touching anything, then generation and lifecycle state under the miniport's own lock; see "`UsbPortRequestAsyncCallback`: what its return value is worth" above |
+| Async timer DPC | `UsbPortRequestAsyncCallback` callbacks run at DISPATCH_LEVEL without either usbport miniport lock [usbport.c:2089-2109], confirmed in the NUSB binary at `0002785E`. They can race `InterruptDpc` and callback paths on SMP, and can run stale after the operation completed - including after a stop and a restart, since nothing can cancel one and usbport zeroes the miniport extension before every start. Validate a token that does *not* live in that extension before touching anything, then generation and lifecycle state under the miniport's own lock; see "`UsbPortRequestAsyncCallback`: what its return value is worth, and what it costs" above |
 | ISR | `InterruptService` runs at DIRQL from usbport's connected ISR; gated by usbport's enable flags [usbport.c:1110-1142] |
 | PASSIVE contexts | `StartController` (can `UsbPortWait`), `StopController`/power paths, and the worker thread that invokes `CheckController` (but under `MiniportSpinLock`, i.e. raised to DISPATCH at the call itself) |
 | Worker/timer | usbport runs a worker thread and a 500 ms timer [pnp.c:881-882]; state-change confirmation is frame-number based [endpoint.c:407-424] |
@@ -2868,6 +2900,28 @@ branch at `0x27874` does test for empty and returns NULL; ReactOS's
 [device.c:938-946] have no counterpart in either shipping binary - the same
 "ReactOS added the guard the shipping code lacks" shape as the
 `NumberOfPorts = 0` arithmetic in section 4.
+
+The SweetLow rebuild has the same unguarded shape (static, read
+2026-09-07; `tools/sweetlow-extracted/USBPORT.SYS`, 134,912 bytes,
+SHA-256 `8A3C9F1B568CB25CF5DD9AF3AF9E5C3400DE24BD087CAA3E4E3345588F5CFB56`).
+Re-derive with MSVC 6 `dumpbin /disasm` on that file; the addresses below
+are the dumper's addresses, as in `usbport-disasm.txt` beside it:
+
+- `CreateDevice` tests the USB2 flag at `0x26B09` and the reported
+  High-Speed bit at `0x26B0F`, then calls `0x26628` at `0x26B1D` with
+  the parent handle and the address of its port local.
+- That `GetTt` walks `+0x10` until speed `+0x38` is 2, updating the output
+  port from `+0x06`. At `0x2664B` it compares the count at `+0x64` with
+  1; `0x26652` sends both zero and one to `0x2667A`.
+- At `0x2667A`-`0x26684`, an empty list at `+0x68` folds to zero. The
+  unconditional `lea ebx,[eax-14h]` at `0x26686` then produces
+  `0xFFFFFFEC`, returned at `0x266E4`-`0x266E8`. The separate multi-TT
+  empty-list exits at `0x26658` and `0x2665E` do not guard this branch.
+
+Thus this rebuild supplies no empty-list guard on which to base a truthful
+root-port speed option. No truthful-speed guest run was made on it; this
+is a static result, not a newly observed bugcheck. Its source package is
+the SweetLow `usb20_win9x.zip` recorded in `legal-provenance.md` section 4.
 
 `USBPORT_OpenPipe` (SP4 `0x24EBC`) then null-checks `TtExtension` at `0x24FC6`,
 which `0xFFFFFFEC` passes, and inserts at `TtExtension + 0xC`:
@@ -3046,8 +3100,8 @@ Win2000 SP4-lineage binary:
     reports allocation/scheduling failure. ReactOS runs an untracked timer
     DPC, exposes no cancellation service, and returns 0 on both success and
     allocation failure. The NUSB build agrees on every point; see
-    "`UsbPortRequestAsyncCallback`: what its return value is worth" in
-    section 4.
+    "`UsbPortRequestAsyncCallback`: what its return value is worth, and what
+    it costs" in section 4.
 11. The two root-hub rules in sections 2 and 4: the endpoint-0 control
     `MPSTATUS` -> `RHSTATUS` mapping that turns `MP_STATUS_FAILURE` into "no
     changes", and the `NumberOfPorts >= 1` requirement. Answered (static,

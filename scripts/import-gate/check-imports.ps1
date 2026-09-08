@@ -54,14 +54,42 @@ param(
     [ValidateSet("auto", "release", "debug", "qemu")]
     [string]$Flavor = "auto",
 
+    # The five path overrides below all default to a file beside this script or
+    # under the repository, resolved after `param(...)` rather than in it,
+    # because `$PSScriptRoot` is not available in a parameter default. They
+    # exist for a host that stages the extracted target material outside the
+    # tree, and for the gate's own tests, which drive it against fixtures.
+    #
+    # **THESE ARE THE GATE'S POLICY, NOT MERELY WHERE IT LOOKS.** The allowlist
+    # IS the rule about which imports are permitted, and the two manifests ARE
+    # the recorded identities an extracted file is held to - so a caller who
+    # points any of them at a file of their own has changed what the gate
+    # enforces, not just where it read it from. That is what they are for: the
+    # tests pass deliberately malformed and deliberately relaxed fixtures. It
+    # also means a build that passes with one of these overridden has not
+    # passed the committed gate, and `scripts\build-driver.cmd` accordingly
+    # passes none of them.
+
+    # The allowlist. Default: xhci98-imports.allow beside this script.
     [string]$AllowPath = "",
 
+    # The usbport import expectations make-usbport-lib.cmd records.
+    # Default: scripts\usbport-lib\usbport-imports.expected.
     [string]$UsbportExpectedPath = "",
 
+    # Where the extracted Windows 2000 SP4 ntoskrnl.exe/hal.dll are staged, for
+    # step 2's export check. Default: tools\win2ksp4-extracted. An absent
+    # directory is the "no baseline present" warning, not a failure.
     [string]$Win2kDir = "",
 
+    # The manifest naming those files and their recorded hashes - what makes an
+    # extracted baseline authenticated rather than merely present.
+    # Default: win2k-baselines.expected beside this script.
     [string]$Win2kManifestPath = "",
 
+    # The Windows 98 / NUSB precedent binaries and their recorded identities,
+    # for step 3's positive-evidence scan. Default: win98-evidence.list beside
+    # this script.
     [string]$Win98EvidenceList = "",
 
     # Overrides where ntkern.vxd is read from, never what it must be: the
@@ -382,7 +410,9 @@ function Get-Win2kBaseline {
 Windows 2000 SP4 baseline in '$Dir' is incomplete or unauthenticated:
   - $($validationErrors -join "`n  - ")
 Fix it one of these ways:
-  - with the recorded SP4 media: scripts\import-gate\extract-target-baselines.ps1 -Force
+  - with the recorded SP4 media, naming the ISO explicitly - with the switch
+    alone and no ISO the script warns and stages nothing:
+      scripts\import-gate\extract-target-baselines.ps1 -Force -Win2KIso <path>
   - without it: delete only the manifest-owned files listed below from '$Dir';
     keep USBPORT/USBEHCI binaries, disassemblies, and every other file there.
     Removing the complete list returns this half of the gate to its
@@ -408,7 +438,15 @@ $manifestFiles
 function Get-Win98Precedent {
     param([object[]]$Rows, [string]$Dumpbin)
 
-    $map = @{}
+    # ORDINAL, because a PowerShell hashtable is case-INSENSITIVE by default
+    # and this map is evidence. `Test-NtkernName` was made `-cmatch` for the
+    # 2026-09-07 audit's H3 and this half was left as it was, so a precedent
+    # binary importing `EXALLOCATEPOOL` still answered for the allowlist's
+    # `ExAllocatePool` - the same wrong evidence in the other of the two
+    # places the Win98 rule is enforced, and the one that is quoted into the
+    # phase records as `win98-precedent <binary>`. An export name differing
+    # only in case is a different symbol, and the loader agrees.
+    $map = New-Object System.Collections.Hashtable([System.StringComparer]::Ordinal)
     $scanned = @()
 
     foreach ($row in @($Rows | Where-Object { $_.Role -eq "precedent" })) {
@@ -461,7 +499,10 @@ function Test-NtkernName {
     # NUL-delimited: the export name tables ntkern.vxd builds hold
     # zero-terminated strings, so this does not match a substring of a longer
     # symbol name.
-    return ($Text -match ("\x00" + [regex]::Escape($Symbol) + "\x00"))
+    # `-cmatch`, not `-match`: an export name differing only in case is a
+    # different symbol, and this line is quoted into the phase records as
+    # evidence for the exact name in the allowlist (the 2026-09-07 audit's H3).
+    return ($Text -cmatch ("\x00" + [regex]::Escape($Symbol) + "\x00"))
 }
 
 # -------------------------------------------------------------------- main ---
@@ -485,7 +526,9 @@ function Test-Image {
         return
     }
 
-    $matched = @{}
+    # Ordinal for the same reason as the precedent map above: the keys are
+    # symbol names, and two that differ only in case are two symbols.
+    $matched = New-Object System.Collections.Hashtable([System.StringComparer]::Ordinal)
 
     foreach ($pair in $pairs) {
         if (-not $pair.ByName) {
@@ -499,14 +542,17 @@ function Test-Image {
         }
 
         $row = $null
+        $pairRows = @()
         foreach ($candidate in $Rules.Allow) {
             if ($candidate.Module -ieq $pair.Module -and $candidate.Symbol -ceq $pair.Symbol) {
-                $row = $candidate
-                break
+                $pairRows += $candidate
+                if ($candidate.Flavors -eq "all" -or $candidate.Flavors -eq $ImageFlavor) {
+                    $row = $candidate
+                }
             }
         }
 
-        if ($null -eq $row) {
+        if ($pairRows.Count -eq 0) {
             $elsewhere = @($Rules.Allow | Where-Object { $_.Symbol -ceq $pair.Symbol })
             if ($elsewhere.Count -gt 0) {
                 Add-Failure "$($pair.Module)!$($pair.Symbol): allowed only from $(($elsewhere | ForEach-Object { $_.Module }) -join ', '). The PE import descriptor names the provider, so this is a different import and only one of them resolves."
@@ -516,8 +562,9 @@ function Test-Image {
             continue
         }
 
-        if ($row.Flavors -ne "all" -and $row.Flavors -ne $ImageFlavor) {
-            Add-Failure "$($pair.Module)!$($pair.Symbol): allowed in the $($row.Flavors) build only, but the $ImageFlavor build imports it."
+        if ($null -eq $row) {
+            $allowedFlavors = ($pairRows | ForEach-Object { $_.Flavors } | Sort-Object -Unique) -join ', '
+            Add-Failure "$($pair.Module)!$($pair.Symbol): allowed in $allowedFlavors only, but the $ImageFlavor build imports it."
             continue
         }
 
@@ -568,6 +615,46 @@ function Test-Image {
 
         if ($evidence.Count -eq 0) {
             Add-Warning "$($pair.Module)!$($pair.Symbol) has no host-side target evidence in this working copy. The allowlist row claims: $($row.Notes)"
+        }
+
+        #
+        # **THE WINDOWS 98 HALF OF THE RULE, ENFORCED RATHER THAN STATED.**
+        #
+        # `xhci98-imports.allow` states it: "every pair here must carry Win98
+        # evidence of its own, because every addition is a new way for the load
+        # to fail silently on Win98". Until the 2026-09-07 audit's H1 nothing
+        # checked it. The warning above fires only when a pair has NO evidence
+        # at all, and a `w2k-export` hit alone satisfies that - so a new kernel
+        # or HAL row whose only evidence is that Windows 2000 exports the
+        # symbol passed silently, which is precisely the case the rule exists
+        # for: Windows 2000 exporting something says nothing about whether
+        # Windows 98's ntkern.vxd does.
+        #
+        # The two things that count as Windows 98 evidence are a precedent
+        # binary importing the same pair and the ntkern.vxd export name table
+        # carrying the symbol. Both are host-side files this repository does
+        # not ship, so the check can only run when they are present: with
+        # neither source loaded there is nothing to conclude and the pair is
+        # left to the warning above. `usbport manifest` is not Windows 98
+        # evidence either way - that module is the same file on both targets.
+        #
+        if ($pair.Module -ieq "ntoskrnl.exe" -or $pair.Module -ieq "hal.dll") {
+            $win98Sources = ($null -ne $Precedent) -or ($null -ne $NtkernText)
+            $win98Evidence = @($evidence | Where-Object {
+                $_ -like "win98-precedent*" -or $_ -eq "ntkern-name"
+            })
+
+            if ($win98Sources -and $win98Evidence.Count -eq 0) {
+                Add-Failure ("$($pair.Module)!$($pair.Symbol) has no WINDOWS 98 evidence: " +
+                    "no precedent binary imports it and it is not in ntkern.vxd's export " +
+                    "name table. A Windows 2000 export does not answer this - see the rule " +
+                    "in scripts\import-gate\xhci98-imports.allow, and build-and-test.md, " +
+                    "'every pair carries Win98 evidence of its own'. Evidence found: $shown")
+            } elseif (-not $win98Sources) {
+                Add-Warning ("$($pair.Module)!$($pair.Symbol): the Windows 98 evidence sources " +
+                    "are not staged in this working copy, so the Win98 half of the allowlist " +
+                    "rule could not be checked for it.")
+            }
         }
     }
 

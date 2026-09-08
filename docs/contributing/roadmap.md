@@ -1,4 +1,4 @@
-﻿# Development Roadmap
+# Development Roadmap
 
 This roadmap is the project-status index: the phase sequence, what each phase
 was for and what it delivered, the basis on which each closed, the task and
@@ -13,8 +13,8 @@ It is meant to orient a contributor. The detail lives in the other documents:
   [`implementation-invariants.md`](implementation-invariants.md).
 - Numbered design records: [`design/`](design/README.md).
 - Measured behaviour, traps and refuted hypotheses: [`lessons.md`](lessons.md);
-  the per-run evidence in the run sheets [`run-11v.md`](runs/run-11v.md) and
-  [`run-13e.md`](runs/run-13e.md).
+  the per-run evidence in the run sheets [`run-11v.md`](runs/run-11v.md),
+  [`run-13e.md`](runs/run-13e.md) and [`run-20.md`](runs/run-20.md).
 - What a user is told (what the driver does, does not, and its known limitations):
   [`../using/release-notes.md`](../using/release-notes.md).
 
@@ -37,8 +37,8 @@ the port driver's role, was the documented fallback and was never needed. USB
 `docs/usb-xhci-info/win98-wdm.md` ("USB Stack Architecture and the Integration
 Decision") and `architecture.md`.
 
-Current status: Phases 0-18 are closed and Phase 19 is open. `1.0.0.0` and
-`1.0.0.1` are cut, and neither has been uploaded; Phase 15 moved the
+Current status: Phases 0-20 are closed. `1.0.0.0`, `1.0.0.1`, `1.0.1.0` and
+`1.0.2.0` are cut, and none has been uploaded; Phase 15 moved the
 tree from revision 1.2 of the xHCI specification to revision 1.2c, the only
 revision Intel now serves, without a code change; Phase 16, the fully
 automated run on freshly installed guests of both targets, closed on
@@ -53,10 +53,16 @@ ME support. Phase 19, opened on 2026-09-03 on branch `1.0.1.0`, is release
 guest measured, an NT install that never had a USB controller has no
 `usbport.sys` for this driver to import, and XP's `usbport` idle-suspends the
 controller so a later hot-plug is invisible; both are INF changes that reach
-Windows 2000 too. Two acts sit outside the task list and are the project
-owner's to take: uploading the asset, and then running the release
-acceptance test by hand on a fresh VM and on a physical machine. The section
-this roadmap ends on is the reminder for the second.
+Windows 2000 too. Phase 20, opened on 2026-09-05 on branch `phase-20` and
+closed on 2026-09-07, is release `1.0.2.0`: the fixes for the 2026-09-05
+repository audit (nineteen findings and six documentation groups), and the
+operating system supplying `usbui.dll` as well, which brings back the USB
+Root Hub's Power tab on the NT targets. Two acts sit outside the task list
+and are the project owner's to take: uploading the asset, and running the
+release acceptance test by hand on a fresh VM and on a physical machine.
+The section this roadmap ends on is the reminder for the second, which runs
+before the upload: settled at `1.0.2.0`, and the order every release follows
+now.
 
 ---
 
@@ -67,7 +73,7 @@ work can be confirmed and has no checkpoint of its own. A VM boot or a bench
 trip is the expensive unit, and most tasks do not need one, so from Phase 6
 onward a phase whose tasks are confirmed in more than one place groups them
 into batches. Phases 6, 7a, 7b, 8, 9, 11 and 13 are of this shape; Phases 0-5,
-10, 12, 14, 15, 16, 17, 18 and 19 have plain per-phase task numbers.
+10, 12, 14, 15, 16, 17, 18, 19 and 20 have plain per-phase task numbers.
 
 Task ids are `<batch>.<n>` in a batched phase (`6-B.4` is the fourth task of
 batch `6-B`) and plain `<phase>.<n>` otherwise (`12.3`, `14.1`). Phases 0-5
@@ -123,10 +129,11 @@ after the cut, moves the tree to revision 1.2c of the xHCI specification, and
 Phase 16 is the unattended post-release run on freshly installed guests. Phase
 17 has the OS supply `usbd.sys` and `usbhub.sys`, Phase 18 is release
 `1.0.0.1` with Windows ME, and Phase 19 is release `1.0.1.0` with Windows XP
-and the NT-side install fixes the XP guest found. Phase
+and the NT-side install fixes the XP guest found. Phase 20 is release
+`1.0.2.0`, the 2026-09-05 audit worked through and cut. Phase
 14 waited on Phase 13's bench batches reporting. Accepting the published release, from the download on a
 freshly installed VM and on a physical machine, is not a phase and has no
-task: it is a hand-run procedure the project owner takes after the upload,
+task: it is a hand-run procedure the project owner takes before the upload,
 and the end of this file says so.
 
 ---
@@ -373,7 +380,14 @@ depends on them.
 
 Status: closed. Checkpoint observed on 2a, 2b (under Driver Verifier) and
 the 2d SMP VM: start, disable/enable, stop and restart with no crash or stale
-MMIO access, the No-Op command completing with the expected TRB pointer, Port
+MMIO access - with one qualification on the Windows 98 half, added later. A
+Device Manager controller disable bugchecks Windows 98 (Phase 3 task 8, and
+reproduced on Microsoft's own `usbehci.sys`; Phase 11 found the same through
+every door), so whatever the 2a leg did here was not that. The record does
+not name the route it used, so read the Windows 98 half as "a stop and a
+restart by some route" rather than as evidence that a disable works
+(`lessons.md`, "A later correction to how the Win98 half of the checkpoint
+may be cited"). The rest of the line is unqualified: the No-Op command completing with the expected TRB pointer, Port
 Status Change events on plug and unplug. `ResumeController` has never run on
 Windows 2000 (no QEMU configuration delivers a sleep state; published as a
 limitation by Phase 13). Task 10 - the `XUSB2PR` run on Intel 7/8-series
@@ -780,10 +794,14 @@ Status: closed. Checkpoint met on the rule "every reachable clause passes on
 both targets, every unreachable clause is recorded with its reason and none is
 reported as passed", across stages A-H of `run-11v.md`.
 
-Ten clauses were never observable in this vehicle and are published, not
-ticked: Win98 disable/re-enable (bugchecks through every door),
-`ResumeController` on Windows 2000, restart after controller invalidation,
-recovery after a controller fails, the scratchpad-limit refusal, rollback after
+Ten clauses were never observable in this vehicle. Nine are published; the
+tenth, restart after controller invalidation, is recorded as not reached in
+`run-11v.md` and is deliberately NOT in the release notes, because the batch
+13-R census found usbport never issues that stop/start, so there is nothing to
+publish a limitation about. The list: Win98 disable/re-enable (bugchecks
+through every door), `ResumeController` on Windows 2000, restart after
+controller invalidation (not published, as above), recovery after a controller
+fails, the scratchpad-limit refusal, rollback after
 a failed start (no *Roll Back Driver* before XP; task 12.3), Low Speed,
 single-/multi-TT hub trees, isochronous on Win98, and the qualifier's
 one-screen budget on a real console.
@@ -1238,7 +1256,7 @@ its checkpoint is an install reading rather than a device reading.
 Tasks:
 
 - [x] 17.0 record the decision in `legal-provenance.md` section 5 before any
-  script change, pointed at from `AGENTS.md`. Done 2026-09-02 (`2256779`).
+  script change, pointed at from `AGENTS.md`. Done 2026-09-02.
 - [x] 17.1 prove the mechanism in the VMs, the owner at the console, all on
   2026-09-02: (a) Windows 98 under SweetLow's stack with no driver, no
   `usbd.sys`, no `usbhub.sys` and no CABs: the install raised the engine's
@@ -1266,7 +1284,8 @@ observed on Windows 98 under both USB 2.0 stacks and on Windows 2000, in the
 VMs, with the root hub up afterwards.
 
 Records: `legal-provenance.md` section 5; `build-and-test.md` ("The files
-the OS supplies: `usbd.sys` and `usbhub.sys`", "The SweetLow stack");
+the OS supplies: `usbport.sys`, `usbd.sys`, `usbhub.sys` and `usbui.dll`",
+"The SweetLow stack");
 `releases/history.md`.
 
 ## Phase 18 - Release `1.0.0.1`: Windows ME, and the Cut
@@ -1320,7 +1339,7 @@ Tasks:
 - [x] 18.6 the `1.0.0.1` history entry carries the Windows ME line; the cut
   fell on the date the three fields already carried, so none moved.
 - [x] 18.7 cut `1.0.0.1` with `make-release.ps1`, every gate green
-  (`1cad620`, re-cut `1a286ca` for readme wording before any upload):
+  (re-cut the same day for readme wording, before any upload):
   `releases/1.0.0.1/` and `out\xhci98-1.0.0.1.zip` (245,067 B), the two
   files per flavour, the two tools with their readmes and NOTICEs, `LICENSE`
   and `readme.txt`, nothing else. The published `xhci98.sys` differs from
@@ -1343,9 +1362,7 @@ the two tools and the readmes and no other file, with the install route
 checked on each target from that asset.
 
 Records: `build-and-test.md` ("Windows ME target VM"); `lessons.md`
-("Windows ME on QEMU"); `scripts/vm-matrix/README.md`; `releases/history.md`;
-`handoff.md`.
-
+("Windows ME on QEMU"); `scripts/vm-matrix/README.md`; `releases/history.md`.
 ## Phase 19 - Release `1.0.1.0`: Windows XP, and the NT Install Fixes
 
 Goal: the driver observed on a 32-bit Windows XP guest with its standing
@@ -1397,7 +1414,7 @@ Tasks:
   extended to the three, `OS-ONWIN98` keeping `usbport.sys` off the Windows
   98 path (its `layout.inf` cannot resolve it), `OS-NEVER` for `usbhub20.sys`
   on no path (the owner's decision: Windows 2000's own `USB.INF` places it
-  when usbport creates the root hub PDO). Landed 2026-09-03 (`83596b1`).
+  when usbport creates the root hub PDO). Landed 2026-09-03.
 - [x] 19.2 the INF, NT path, idle suspend: `Services\USB\DisableSelectiveSuspend`
   written from `[Xhci.Dev.NTx86]` and `[DefaultInstall.NTx86]` as the 9x
   path has done since `1.0.0.0`, the gate requiring it once per route on
@@ -1444,7 +1461,7 @@ Tasks:
   closes that extension alone and counts `Ep0RemovesSuperseded`, leaving
   the binding, the owed invalidate, the EP0 queue and any pending
   SET_ADDRESS to the live handle. Two host vectors model the `p194` order
-  and failed on the old path exactly as the run did (`c1ed2cb`). The closing
+  and failed on the old path exactly as the run did. The closing
   reading (run `i4b`, a clean-snapshot reinstall): the restore recurred on
   the first attach of both `usb-storage` and `usb-audio`, the counter moved
   to 1 and 2, and both bound with every failure counter at zero. Both
@@ -1466,7 +1483,7 @@ Tasks:
   QEMU's default host backend and stalled the monitor; the run declares
   `-audiodev none` since. Reports in
   `docs\contributing\runs\run-19-post-release\`.
-- [x] 19.9 the cut, 2026-09-04 (`9cf9dda`; re-cut `59ae951` the same morning
+- [x] 19.9 the cut, 2026-09-04 (re-cut the same morning
   for the readme's opening paragraph, before any upload): the date in
   `src\xhci_version.h`, the INF's `DriverVer`, the history heading and the
   release notes; `build-driver.cmd all` and both tools rebuilt after the
@@ -1500,21 +1517,84 @@ rebuild"); `docs/issues/04-xp-restore-device-ep0-remove.md`;
 `scripts/inf-gate/`; `releases/history.md`;
 `docs/contributing/runs/run-19-post-release/`.
 
+## Phase 20 - Release `1.0.2.0`: The 2026-09-05 Audit Fixes
+
+Goal: every finding of the 2026-09-05 repository audit (no
+critical defect; nineteen findings F1-F19 and six documentation groups D1-D6)
+either fixed with the regression vector that pins it or recorded as an owner
+decision with its reason; the gates green; both targets' post-release matrix
+no worse than Phase 19's; and the result cut as `1.0.2.0`.
+
+Status: closed on 2026-09-07 on the cut and its guest readings. It opened on
+2026-09-05 on branch `phase-20`, renamed to `1.0.2.0` on 2026-09-06, the
+third field moving because the phase carries driver code changes. Every gate
+is green, the version is cut, the install route from the published download
+reads clean on four targets, and the confirming matrix on this release's own
+driver matches 20.8's reports but for one transfer count. One checkpoint
+clause is met on the development machine rather than in a guest: no guest has
+been made to produce the state this release's new control-endpoint refusal
+guards, so the guests read its other half, that a legitimate reopen is not
+refused. The acceptance test from the download, the upload and the push
+remain, and are the owner's alone.
+
+The install gains one file: the OS supplies `usbui.dll` as well, by the same
+`LayoutFile` route as the three drivers but to dirid 11 rather than their
+dirid 10, the INF gate holding it there. Windows 2000's `USB.INF` and Windows XP's `usbport.inf` already name
+that file as the root hub's property-page provider, so on an xHCI-only
+machine the reference dangled and the Power tab was silently absent.
+Measured in both NT guests (`build-and-test.md`), and the acceptance test
+takes the tab at step 4.7.
+
+Why a phase: the findings interact - F3 and F9 are one verdict rule from two
+sides, F1 and F8 both table ownership, F6, F7, F18 and D1 the same shipped
+statements - so a piecemeal fix on a release branch would repeat their drift.
+
+Tasks, in the audit's revised order, all closed.
+[`runs/run-20.md`](runs/run-20.md) is the record: what each task changed, the
+vectors behind it, and every reading.
+
+| Task | Subject |
+|---|---|
+| 20.0 | the matrix verdict (F3, F9, F11) |
+| 20.1 | the packaging guards (F4, F14, F15) |
+| 20.2 | endpoint and device-table ownership (F1, F8) |
+| 20.3 | recovery delivery loss (F2) |
+| 20.4 | the shipped statements (F6, F7, F18, D1) |
+| 20.5 | the register and tool items (F5, F10, F12, F13, F16, F17) |
+| 20.6 | the smaller items and D2-D6 |
+| 20.7 | the gates and the guest readings; F19 was found and fixed here |
+| 20.8 | the Windows 98 audio replug row, read with that target run alone |
+| 20.9 | the cut, `usbui.dll`, and the readings on the published asset |
+
+Checkpoint: every finding closed with a cited commit and regression vector or
+recorded as an owner decision with its reason; every gate and self-test
+green; the post-release matrix on both primary targets no worse than the
+Phase 19 reports; the Windows 2000 SMP recovery and XP lifecycle readings
+taken for 20.2; and the version cut. Not a checkpoint: a host test standing
+in for a guest.
+
+Records: `runs/run-20.md`; design records 05, 06 and 07; `build-and-test.md`;
+`lessons.md`; `runs/run-20-post-release/`; `releases/history.md`.
+
 ## Post-Release - Run the Acceptance Test by Hand
 
 This is not a phase, has no task id, and nothing in this repository closes
 it. It is the reminder the roadmap ends on.
 
-Once `out\xhci98-1.0.0.1.zip` is uploaded, run
+Before the newest cut's asset (`out\xhci98-<version>.zip`, for the version
+`releases/history.md` names first) is uploaded, run
 [`release-acceptance-test.md`](../using/release-acceptance-test.md) end to end,
 by hand, twice: on a freshly installed VM of the target, and on a physical
-machine. Take the release from the published download, not this tree, and
-follow the document the download ships. Neither run substitutes for the
+machine. Take the release from that asset, unzipped, not from this tree, and
+follow the document the asset ships. Running it before the upload is what lets
+it stand as the install reading for the targets no other run covers, and it is
+why a finding against the driver can still be answered by a re-cut under the
+same number rather than by a new one. Neither run substitutes for the
 other: a fresh VM is the only cheap, repeatable clean install carrying nothing
 this project put there, but cannot test the BIOS handoff, a real interrupt pin
 or an uncharacterised controller; a physical machine tests those and cannot be
 reinstalled on a whim. `scripts/vm-matrix/` is how a guest is built; the run
-itself uses only what the download provides.
+itself uses only what the asset provides.
 
 No machine model is named: whatever machine is to hand, on whichever target it
 boots, is the subject, and step 1 records what it was (on Windows 98, whether
@@ -1526,10 +1606,12 @@ lacks, that is the finding.
 Nothing is reported back into this repository. What comes back is a defect
 against the driver, as an issue, and a defect against the procedure, as an
 edit to `release-acceptance-test.md`. A driver defect found this way is
-fixed and the existing release re-cut with the fix; it is not a reason to
-withdraw the release, and it does not open a new version number. The one
-thing a failure changes immediately is what `docs/using/release-notes.md`
-claims.
+fixed before the upload by a re-cut under the same number, which
+`releases/README.md` permits while nothing has been uploaded. If the finding
+arrives after the upload instead, the same README's rule binds and the fix
+opens a new version number, with its own `history.md` entry; it is not a
+reason to withdraw the release. The one thing a
+failure changes immediately is what `docs/using/release-notes.md` claims.
 
 Records: `docs/using/release-acceptance-test.md`; `releases/README.md`;
 `build-and-test.md` ("Available Test Hardware", "The bench rig",

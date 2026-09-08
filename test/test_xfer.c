@@ -33,34 +33,7 @@
 
 #include <stdio.h>
 #include "../src/xhci_xfer.h"
-
-static int failures;
-static int checks;
-
-#define CHECK(cond, what) check_impl((cond), (what), __LINE__)
-
-static void check_impl(int cond, const char *what, int line)
-{
-    checks++;
-    if (!cond) {
-        failures++;
-        printf("FAIL %s:%d: %s\n", "test_xfer.c", line, what);
-    }
-}
-
-#define CHECK_EQ(got, want, what) \
-    check_eq_impl((unsigned long)(got), (unsigned long)(want), (what), __LINE__)
-
-static void check_eq_impl(unsigned long got, unsigned long want,
-                          const char *what, int line)
-{
-    checks++;
-    if (got != want) {
-        failures++;
-        printf("FAIL %s:%d: %s (got %lu / 0x%lX, want %lu / 0x%lX)\n",
-               "test_xfer.c", line, what, got, got, want, want);
-    }
-}
+#include "test_harness.h"
 
 #define RING_PA 0x0F001000UL
 
@@ -381,12 +354,12 @@ static void test_completion_code_mapping(void)
 /* ------------------------------------------------------------------ */
 
 /*
- * SET_ADDRESS is the no-data shape and the one every enumeration starts with.
- * It is also the transfer that must never reach a ring at all (task 6-B.3
- * intercepts it), which is exactly why the *shape* is pinned here: the
- * interception is a decision made above this layer, and this layer has to build
- * a correct no-data TD for every other zero-length request - SET_CONFIGURATION,
- * SET_INTERFACE, CLEAR_FEATURE.
+ * SET_CONFIGURATION is the no-data shape every configured device goes through;
+ * SET_INTERFACE and CLEAR_FEATURE are the same shape. The vector used to pin
+ * SET_ADDRESS, which is also zero-length - but that is the one request that
+ * must never reach a ring at all (task 6-B.3 intercepts it, and test_init
+ * asserts it is never placed), so encoding it as a correct TD taught the suite
+ * the forbidden request's ring shape (roadmap Phase 20, smaller items).
  */
 static void test_build_no_data(void)
 {
@@ -394,8 +367,8 @@ static void test_build_no_data(void)
     XHCI_CONTROL_LAYOUT layout;
     XHCI_TRB out[XHCI_XFER_MAX_CONTROL_TRBS];
 
-    /* bmRequestType 0x00, bRequest 5, wValue 3, wIndex 0, wLength 0. */
-    request_init(&req, 0x00, 0x05, 3, 0, 0, 0, 8, NULL);
+    /* bmRequestType 0x00, bRequest 9, wValue 1, wIndex 0, wLength 0. */
+    request_init(&req, 0x00, 0x09, 1, 0, 0, 0, 8, NULL);
     CHECK_EQ(XhciXferBuildControl(&req, out, XHCI_XFER_MAX_CONTROL_TRBS,
                                   &layout),
              XHCI_XFER_OK, "no-data control transfer built");
@@ -408,8 +381,8 @@ static void test_build_no_data(void)
     CHECK_EQ(layout.TdLengths[1], 1, "Status Stage TD is one TRB");
 
     /* Setup Stage TRB, Figure 6-9 / Tables 6-23..6-26. DW0 is
-     * bmRequestType | bRequest << 8 | wValue << 16 = 0x00 | 0x0500 | 0x30000. */
-    CHECK_EQ(out[0].Param0, 0x00030500UL, "SETUP bytes 0-3 as immediate data");
+     * bmRequestType | bRequest << 8 | wValue << 16 = 0x00 | 0x0900 | 0x10000. */
+    CHECK_EQ(out[0].Param0, 0x00010900UL, "SETUP bytes 0-3 as immediate data");
     CHECK_EQ(out[0].Param1, 0x00000000UL, "wIndex 0, wLength 0");
     CHECK_EQ(out[0].Status, 8UL, "TRB Transfer Length is always 8");
     /* Type 2 << 10 = 0x800, IDT = 0x40, TRT = 0 (No Data Stage). */
@@ -908,7 +881,15 @@ typedef struct _XFER_FIXTURE {
     XHCI_RING ring;
     XHCI_TRANSFER_QUEUE queue;
     XHCI_TRB scratch[XHCI_XFER_MAX_CONTROL_TRBS];
-    XHCI_TRANSFER transfers[4];
+    /*
+     * Eight, not four. `test_submit_normal_ring_full` needs seven distinct
+     * records to fill a ring and be refused on the eighth, and until the
+     * 2026-09-07 audit's G3 it re-used records 0, 1 and 2 while they were
+     * still queued - which design record 03 section 5 forbids by name, and
+     * which left the queue corrupt and two records unreachable for the rest
+     * of that vector.
+     */
+    XHCI_TRANSFER transfers[8];
     SG_BUFFER sg;
     XHCI_CONTROL_REQUEST req;
 } XFER_FIXTURE;
@@ -2469,22 +2450,27 @@ static void test_submit_normal_ring_full(void)
     ULONG enqueueBefore;
     ULONG i;
 
-    /* 8 TRBs is 6 usable slots, and each transfer here is one TRB. */
+    /*
+     * 8 TRBs is 6 usable slots, and each transfer here is one TRB. Every
+     * submission uses a record of its own: re-submitting a record that is
+     * still queued is forbidden (design record 03 section 5), and doing it
+     * here corrupted the queue for the rest of the vector rather than testing
+     * anything.
+     */
     fixture_init(&fix, 8);
-    for (i = 0; i < 4; i++) {
-        CHECK_EQ(fixture_submit_interrupt(&fix, i % 4, 8), XHCI_XFER_OK,
+    for (i = 0; i < 6; i++) {
+        CHECK_EQ(fixture_submit_interrupt(&fix, i, 8), XHCI_XFER_OK,
                  "fits");
     }
-    /* Fill the remaining two slots with the same transfer records - the queue
-     * bookkeeping is not what this checks, the ring's refusal is. */
-    (VOID)fixture_submit_interrupt(&fix, 0, 8);
-    (VOID)fixture_submit_interrupt(&fix, 1, 8);
     enqueueBefore = fix.ring.Enqueue;
     CHECK_EQ(XhciRingFree(&fix.ring), 0, "the ring is full");
+    CHECK_EQ(fix.queue.Count, 6UL,
+             "and the queue holds all six, none of them displaced");
 
-    CHECK_EQ(fixture_submit_interrupt(&fix, 2, 8), XHCI_XFER_BUSY,
+    CHECK_EQ(fixture_submit_interrupt(&fix, 6, 8), XHCI_XFER_BUSY,
              "the next transfer is refused");
     CHECK_EQ(fix.ring.Enqueue, enqueueBefore, "nothing was written");
+    CHECK_EQ(fix.queue.Count, 6UL, "and nothing was queued for it either");
 }
 
 /* ------------------------------------------------------------------ */
@@ -2716,8 +2702,19 @@ static void test_event_success(void)
      * case, not an error (4.11.3.1). */
     CHECK_EQ(deliver(&fix, 2, XHCI_CC_SUCCESS, 0, &result), XHCI_XFER_OK, "ok");
     CHECK_EQ(result.Action, XHCI_XFER_ACTION_NONE, "nothing to do");
-    CHECK_EQ(fix.queue.UnmatchedEvents + fix.queue.ForeignEvents, 1,
-             "counted once, as unowned");
+    /*
+     * Counted apart, not summed. Until the 2026-09-07 audit's G11 this was
+     * `UnmatchedEvents + ForeignEvents == 1`, which passes whichever of the
+     * two the classifier picked - and the two mean different things: an
+     * unmatched event names a TRB on this ring that no record owns, while a
+     * foreign one names a TRB that is not on this ring at all. A misclassified
+     * off-ring event is exactly the reading that would send a Set TR Dequeue
+     * to the wrong endpoint.
+     */
+    CHECK_EQ(fix.queue.UnmatchedEvents, 1,
+             "counted once, as unmatched - this TRB is on our ring");
+    CHECK_EQ(fix.queue.ForeignEvents, 0,
+             "and not as foreign, which would name another ring");
 }
 
 /*
@@ -3052,6 +3049,21 @@ static void test_event_stall(void)
              "an error on the data stage ends the transfer");
     CHECK_EQ((ULONG)result.Completed->UsbdStatus, WANT_USBD_STALL_PID, "stalled");
     CHECK_EQ(result.Completed->BytesTransferred, 0, "18 asked, 18 not delivered");
+    /*
+     * That zero is a weak reading on its own (G11): a residual equal to the
+     * TRB length gives the same answer as skipping the subtraction entirely.
+     * The same stall with a PARTIAL residual is what separates the two - and
+     * it is the realistic shape, since a device that stalls mid-packet has
+     * already moved some bytes.
+     */
+    fixture_init(&fix, 32);
+    CHECK_EQ(fixture_submit_in(&fix, 0, 18), XHCI_XFER_OK, "submitted again");
+    CHECK_EQ(deliver(&fix, 1, XHCI_CC_STALL, 6, &result), XHCI_XFER_OK, "ok");
+    CHECK_EQ(result.Action, XHCI_XFER_ACTION_COMPLETE, "still ends it");
+    CHECK_EQ((ULONG)result.Completed->UsbdStatus, WANT_USBD_STALL_PID,
+             "still a stall");
+    CHECK_EQ(result.Completed->BytesTransferred, 12,
+             "18 asked, 6 residual, so 12 arrived - the subtraction is real");
     CHECK_EQ(result.NeedsRecovery, 1, "and the endpoint is halted");
     CHECK_EQ(fix.queue.Recoveries, 1, "counted");
     CHECK_EQ(fix.queue.Errors, 1, "counted as an error");
@@ -3252,6 +3264,49 @@ static void test_event_rejections(void)
              XHCI_XFER_OK, "ok");
     CHECK_EQ(fix.queue.ForeignEvents, 4, "off this ring");
 
+    /* RsvdZ bits 3:0 set on an address that IS on this ring (the 2026-09-05
+     * audit's first smaller item): masked off and counted, so the event
+     * resolves to its TRB instead of being refused as misaligned - here to an
+     * index no transfer owns, which is the unmatched count, not the foreign
+     * one. Before the mask this read as a fifth foreign event. */
+    {
+        ULONG unmatched;
+
+        unmatched = fix.queue.UnmatchedEvents;
+        CHECK_EQ(XhciXferEvent(&fix.queue, &fix.ring, FIX_SLOT, FIX_DCI,
+                               XhciRingTrbPA(&fix.ring, 20) | 0x8UL,
+                               event_dw2(XHCI_CC_SUCCESS, 0),
+                               event_dw3(FIX_SLOT, FIX_DCI), &result),
+                 XHCI_XFER_OK, "ok");
+        CHECK_EQ(fix.queue.ReservedBitsSet, 1, "RsvdZ pointer bits counted");
+        CHECK_EQ(fix.queue.ForeignEvents, 4, "and not read as off this ring");
+        CHECK_EQ(fix.queue.UnmatchedEvents, unmatched + 1,
+                 "but resolved to its (unowned) TRB");
+        CHECK_EQ(fix.queue.Count, 1, "with the transfer untouched");
+    }
+    /* ...and on an OWNED TRB the event has to go all the way to a completion:
+     * the mask must reach the classifier, not only the first lookup (the
+     * Phase 20 review's round 2 found it stopping short, and this vector's
+     * unowned cousin above returned before the classifier could refuse). A
+     * fresh fixture, so the rejections above keep their transfer. */
+    {
+        XFER_FIXTURE owned;
+
+        fixture_init(&owned, 32);
+        CHECK_EQ(fixture_submit_in(&owned, 0, 18), XHCI_XFER_OK, "submitted");
+        CHECK_EQ(XhciXferEvent(&owned.queue, &owned.ring, FIX_SLOT, FIX_DCI,
+                               XhciRingTrbPA(&owned.ring, 2) | 0x4UL,
+                               event_dw2(XHCI_CC_SUCCESS, 0),
+                               event_dw3(FIX_SLOT, FIX_DCI), &result),
+                 XHCI_XFER_OK, "ok");
+        CHECK_EQ(owned.queue.ReservedBitsSet, 1, "RsvdZ bits counted");
+        CHECK_EQ(result.Action, XHCI_XFER_ACTION_COMPLETE,
+                 "and the Status Stage event completes the transfer regardless");
+        CHECK_EQ(owned.queue.Count, 0, "which is retired");
+        CHECK_EQ(owned.queue.ForeignEvents + owned.queue.UnmatchedEvents, 0,
+                 "with nothing read as foreign or unmatched");
+    }
+
     /* A code no Transfer Event on this ring may carry. Nothing here knows what
      * the controller did with the TRBs, so nothing is retired or completed. */
     CHECK_EQ(deliver(&fix, 2, XHCI_CC_COMMAND_ABORTED, 0, &result),
@@ -3264,7 +3319,8 @@ static void test_event_rejections(void)
     CHECK_EQ(deliver(&fix, 10, XHCI_CC_SUCCESS, 0, &result),
              XHCI_XFER_OK, "ok");
     CHECK_EQ(result.Action, XHCI_XFER_ACTION_NONE, "not ours");
-    CHECK_EQ(fix.queue.UnmatchedEvents, 1, "counted");
+    CHECK_EQ(fix.queue.UnmatchedEvents, 2,
+             "counted (the RsvdZ vector above was the first)");
 
     CHECK_EQ(XhciXferEvent(NULL, &fix.ring, FIX_SLOT, FIX_DCI, 0, 0, 0, &result),
              XHCI_XFER_BAD_PARAM, "NULL queue");

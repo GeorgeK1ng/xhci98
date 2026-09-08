@@ -117,8 +117,10 @@ and assembly, but it is not only that:
   "`system dos32a` embeds the full DOS/32A extender as the EXE stub ... so
   XHCIQUAL.EXE is one standalone file - no DOS4GW.EXE to carry." The linker map
   states it independently at its head: "creating a DOS/32 Advanced DOS Extender
-  (LE-style) executable". Static, read from `xhciqual/xhciqual.map` and the
-  makefile.
+  (LE-style) executable". Static, read from the linker map and the makefile. The tracked copy of the
+  map is `releases/<version>/xhciqual/XHCIQUAL.MAP`, which every release
+  stages beside the executable; `xhciqual/xhciqual.map` is the build's own
+  output and is git-ignored.
 - Open Watcom C runtime, statically linked. `XHCIQUAL.MAP` names the modules
   individually against `C:\WATCOM\lib386\dos\clib3r.lib` (`_strcmp`,
   `strncmp.c`, `fopen.c`, and others). Static, read from the map.
@@ -321,6 +323,27 @@ and nothing was disassembled, and no file from it is kept in this tree or
 under `tools/`. The facts are in `docs/contributing/build-and-test.md`,
 "Windows ME target VM".
 
+The four target CDs were read at the file level again on 2026-09-07, for the
+`usbui.dll` question: each one's `layout.inf` (from `PRECOPY1.CAB` on the two
+9x CDs, and `I386\LAYOUT.INF`, which the NT CDs carry uncompressed), and the
+`usbui.dll` and `sysclass.dll` files themselves, extracted with 7-Zip and
+`expand.exe`. Method static: the PE export and import tables were read with a
+parser, nothing was disassembled and nothing was executed. What it established
+is in `docs/contributing/build-and-test.md`, "The files the OS supplies" -
+four distinct per-OS `usbui.dll` builds, each exporting
+`USBControllerPropPageProvider` and `USBHubPropPageProvider`, and a 9x
+`sysclass.dll` that is a 16-bit NE module carrying the string `usbui.dll`. No
+file from any of those CDs is kept in this tree or under `tools/`; the copies
+read were staged into a scratch directory outside the repository.
+
+Separately, and not a binary-derived fact at all: the Device Manager behaviour
+those files drive was observed the same day in the four target virtual
+machines, by opening property sheets with the file present and with it absent.
+Those are observations of Windows' own user interface, made with this driver
+installed but not through its counters or its traces, so they carry neither
+the static nor the runtime tag defined above. `build-and-test.md` records them
+as guest readings, naming the guest each came from.
+
 A further package has been read, statically and at run time, on 2026-09-02:
 SweetLow's USB 2.0 stack for Windows 98, `usb20_win9x.zip`, from the download
 link its author gave the project owner
@@ -369,6 +392,7 @@ the roadmap's per-task boxes hold the rest, each with its own method stated.
 
 | Fact | Method | Where recorded |
 |---|---|---|
+| SweetLow's `USBPORT.SYS` has the same unguarded single-TT lookup: `CreateDevice` calls `0x26628` at `0x26B1D`; a zero count takes `0x2667A` and the empty list becomes `0xFFFFFFEC` at `0x26686` | static: MSVC 6 `dumpbin /disasm` on the 134,912-byte file, SHA-256 `8A3C9F1B568CB25CF5DD9AF3AF9E5C3400DE24BD087CAA3E4E3345588F5CFB56`; no truthful-speed execution | abi section 8; issue 06 section 6 |
 | `USBPORT_GetHciMn` present at ordinal 2, `USBPORT_RegisterUSBPortDriver` at 3, plus an undocumented `DllUnload` at 1; `usbehci.sys` imports only the first two | static (`dumpbin /exports`) | abi §1 |
 | `USBPORT_REGISTRATION_PACKET` layout identical across all three builds (Phase 3 task 1) | static | abi §3 |
 | The SweetLow WinDDK rebuild (5.1.2600.2180, Windows 98) has the same three exports and ordinals, the same `>= 100` / `>= 200` gate, the 300/316-byte copy, the 0x150 wrapper with `Version` at +0x10 and the packet at +0x14, writes the same 16 service pointers, and returns `0x10000001` from `USBPORT_GetHciMn` | both: read from `tools/sweetlow-extracted/usbport-registration-disasm.txt`, then `USBPORT_GetHciMn=10000001` and `packet size=0000013C` in this driver's trace on the `2a-sweetlow` guest | interface doc section 5, "The SweetLow rebuild" |
@@ -385,7 +409,7 @@ the roadmap's per-task boxes hold the rest, each with its own method stated.
 | Post-`SubmitTransfer` lifetime: usbport's post-callback writes happen after it releases the miniport lock, and the completion path takes no lock ordering it behind them | static | abi §4 |
 | `AbortTransfer` post-return lifetime: usbport retains nothing, the record is `ExFreePool`d in the same worker pass, and the miniport extension is interior to the freed block | static | abi §4 |
 | `ENDPOINT_FLAG_NUKE` is a controller-teardown flag; on that path usbport completes and frees transfers with no miniport callback | static, with the whole-image negative enumerated so it is checkable without the files | abi §4 |
-| The `USBPORT_GetTt` defect: `USBPORT_CreateDevice` gates the TT lookup on `USB_MINIPORT_FLAGS_USB2` and not-High-Speed; `USBPORT_GetTt`'s single-TT branch has no empty-list guard and returns `0xFFFFFFEC`, which `OpenPipe`'s null check passes, bugchecking in `ExfInterlockedInsertTailList` | both: the bugcheck was observed on both targets first, then read out of the instructions | abi §6; the resulting untruth is in `docs/contributing/implementation-invariants.md`, "Root Hub Reporting" |
+| The `USBPORT_GetTt` defect: `USBPORT_CreateDevice` gates the TT lookup on `USB_MINIPORT_FLAGS_USB2` and not-High-Speed; `USBPORT_GetTt`'s single-TT branch has no empty-list guard and returns `0xFFFFFFEC`, which `OpenPipe`'s null check passes, bugchecking in `ExfInterlockedInsertTailList` | both: the bugcheck was observed on both targets first, then read out of the instructions | abi §8 ("The transaction-translator lookup, and why `USB_MINIPORT_FLAGS_USB2` must be set"); the resulting untruth is in `docs/contributing/implementation-invariants.md`, "Root Hub Reporting" |
 | Hub-descriptor request shape, and `PowerOnToPowerGood` copied straight through and truncated to a UCHAR (so 20 ms encodes as 10) | static | abi open item 7, root-hub block in §4 |
 | Root-hub `RH_DisableIrq`/`RH_EnableIrq` lifecycle: a close is not guaranteed a matching open; per-build addresses recorded | static | abi §4 |
 | `RH_SetFeatureUSB2PortPower`'s helper drops its lock before the callback (correcting an earlier wrong claim); caller-held locking in general remains unverified | static | abi §4 |
@@ -400,6 +424,10 @@ the roadmap's per-task boxes hold the rest, each with its own method stated.
 | The shipping `usbehci.sys` calls that slot exactly once per image, with `BOOL = TRUE` and a 4-byte read of `L"EnIdleEndpointSupport"`, from inside `StartController` | static (both builds) | abi §6, task 11-V.7 box |
 | Controller-lifecycle census: whole-image enumeration of usbport's slot calls finds exactly three `StartController` and three `StopController` call sites per build and exactly one `ResetController`; every direct caller chain out of the five routines holding them terminates at an `IRP_MJ_PNP` or `IRP_MJ_POWER` handler (plus, in the Win2000/XP build only, an HCD IOCTL that requests a power transition); and the reset DPC's body arms nothing after calling the slot. A transitive whole-image negative was attempted and is explicitly not claimed: indirect transfers are unclassified, and the attempt produced a known false edge. The only producer of `UsbPortInvalidateController(RESET)` is a miniport: usbport's one internal call site passes `SURPRISE_REMOVE` | static (both builds; the commands, the instruction pair enumerated, and every per-build address recorded, so the census is re-runnable without the files) | abi §4, the two notes after the `UsbPortInvalidateController(RESET)` box |
 | What drives `PassThru` (packet slot 0xE0): the user-mode escape is `IOCTL_USB_USER_REQUEST` `0x00220438`, METHOD_BUFFERED, `UsbUserRequest == 3`, reached through the `\DosDevices\HCD<n>` symbolic link the HCD FDO's start path creates; the buffer contract, the non-paged copy usbport hands the callback, PASSIVE_LEVEL with no usbport lock held, and the second site being a test-mode-only internal probe whose fallback to `RH_GetPortStatus` fires only on a return of exactly 6 | both. Static for all of it, from the binaries' own comparison chains rather than from a header (the Win2000 DDK here has no `usbuser.h`). Runtime on the Windows 98 target, on the NUSB 5652 build this was read out of, in the 2a guest: the link opens, the round trip completes, the four `-probe` controls return 0 / 2 / 4 / 7, and the driver's own trace carries `cb PassThru` lines. Runtime on Windows 2000 as well: in the 2b guest, against SP4's own `usbport.sys` 6681, the link opens, the round trip completes, and the four `-probe` controls return the same 0 / 2 / 4 / 7. So the structural reading of the SP4 binary is an observation on both targets, and the two builds answer this escape identically at run time as well as in their comparison chains. The same run also measured the route's one limit: usbport builds its link at a fixed index with no retry, so on a machine where Windows 98's own USB stack already owns that name no usbport link appears at all | abi §4, "Debug / single-packet" box |
+| SP4's native `usbhub.sys` (5.00.2195.6689, 40,176 B, from the fresh Windows 2000 image) carries no `SelectiveSuspend`, `DisableSelectiveSuspend` or `IdleNotification` string, ASCII or UTF-16; SP4's `usbport.sys` (5.00.2195.6681) carries `DisableSelectiveSuspend` (3), `HcDisableSelectiveSuspend` (2) and `SelectiveSuspend` (3) | static (a string search over the files extracted from the image; nothing disassembled, nothing executed) | build-and-test.md, "A replug onto an idle-suspended controller"; F18's Windows 2000 reading |
+| NUSB 3.6's `usbhub20.sys` (5.00.2195.6891, 50,032 B) carries `DisableSelectiveSuspend` (1) and `SelectiveSuspend` (1); NUSB 3.6's `usbhub.sys` (4.90.3002.1) carries none; NUSB 3.6's `usbport.sys` (5.00.2195.5652) carries the same three names as SP4's | static (string search, as above) | the same site: an unconfirmed candidate explanation for the differing bounded idle observations on the two targets (`build-and-test.md`) |
+| Windows 98 SE's `usbd.sys` 4.10.2222 (18,912 B) exports `USBD_ParseConfigurationDescriptor` and `USBD_CreateConfigurationRequestEx` but not `USBD_ParseDescriptors`; NUSB 3.6's Windows ME `usbd.sys` 4.90.3000.1 (22,928 B) exports `USBD_ParseDescriptors` and `USBD_ParseConfigurationDescriptorEx` as well | static (`dumpbin /exports`), corroborated at runtime by a third-party filter that imports the symbol failing to load (Code 2) under the first file and loading under the second | `docs/issues/06-full-speed-root-port-bugcheck.md` section 4; the run record is `out\post-release\issue4-hidusbf\README.md` (git-ignored, this host) |
+| SweetLow's hidusbf Windows 9x lower filter (`hidusbf.sys` 1.2.0.10, 3,648 B, a public-domain third-party binary, not tracked): reads a `bInterval` DWORD from the device's driver key at `AddDevice` and rewrites the interrupt endpoints' `bInterval` in the `URB_FUNCTION_SELECT_CONFIGURATION` configuration descriptor before passing it down; imports `USBD.SYS!_USBD_ParseDescriptors@16` | static (`dumpbin /disasm`, `/imports`), corroborated at runtime by the `Period` this driver received changing with the value | same |
 
 Where a fact is inferred rather than read, this project's documents say so,
 and several of them record refutations of earlier readings. That habit is what
@@ -518,8 +546,9 @@ system's own install source: `LayoutFile=layout.inf` in the INF's
 `[Version]` section resolves a `CopyFiles` entry the INF's own
 `[SourceDisksFiles]` does not name through the OS's `layout.inf`, and the
 engine fetches the file from the Windows source path (the CABs on the hard
-disk or the Windows 98 CD, and Windows 2000's own `driver.cab`), with the
-same `COPYFLG_NO_OVERWRITE`. The release download carries this project's own
+disk or the Windows 98 CD, and the NT targets' own driver cache: Windows
+2000's `sp4.cab`, Windows XP's `sp3.cab`), with the same
+`COPYFLG_NO_OVERWRITE`. The release download carries this project's own
 files, the two tools and the readmes, and no Microsoft file; the INF gate
 refuses an INF or a package that names one (`OS-MEDIA`, `PKG-MSFILE`);
 `scripts/package/usbd-sources.expected` and the three-file wording in
@@ -539,19 +568,21 @@ rules above was relaxed; roadmap Phase 19 has the tasks.
 
 Status: the exception was never used. No asset of any version was uploaded
 while it stood; this repository was private throughout, and the first upload
-is intended to be 1.0.0.1, which carries nothing under it. "The release
-download carries three of them" was true of the assembled asset from 0.0.0.4
-to 1.0.0.0 and of no download anyone made.
+is intended to be the newest cut (1.0.2.0 as of 2026-09-07; `releases/history.md`
+names it first), every cut since 1.0.0.1 carrying nothing under it. "The
+release download carries three of them" was true of the assembled asset from
+0.0.0.4 to 1.0.0.0 and of no download anyone made.
 
-This note can look stale and is not. A version directory exists under
-`releases/`, `README.md` links a releases page, and this repository's prose
+This note can look stale and is not. Version directories exist under
+`releases/`, the issue-form configuration and the generated `readme.txt` link a
+releases page, and this repository's prose
 calls a cut asset "published". None of the three is a distribution: a cut
 writes `releases/<version>/` and `out/xhci98-<version>.zip` in this working
 tree, a publish uploads that zip to a GitHub release, and this project has
 done the first and never the second. "Published" in that usage names which
 asset filename was in use at a cut, and `README.md`'s link is written for the
 repository as it will be. The roadmap carries no clause for the upload at
-all, deliberately: Phase 14 closed on the cut, and the upload is one act of
+all: Phase 14 closed on the cut, and the upload is one act of
 the project owner's rather than work this repository can do or close. When
 it happens, this note is the sentence that moves.
 
