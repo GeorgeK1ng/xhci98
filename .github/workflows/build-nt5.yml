@@ -13,7 +13,7 @@ jobs:
       WDK_INSTALL_DIR: C:\WinDDK
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download and install WDK 7.1
         shell: pwsh
@@ -90,7 +90,7 @@ jobs:
             throw "Builds missing xhci98.sys: $($missing -join ', ')"
           }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: xhci98-windows-xp-through-7
